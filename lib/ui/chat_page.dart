@@ -5,6 +5,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart' show ScrollDirection;
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../protocol/channel_client.dart';
 import '../protocol/conversation.dart';
@@ -218,6 +219,11 @@ class _ChatPageState extends State<ChatPage> {
   bool _sending = false;
   bool _loadingStalled = false;
   Timer? _loadingTimer;
+
+  /// The desktop flags a task unread on new output even while this page is
+  /// subscribed, so the viewer side must clear it: when the conversation
+  /// opens, while frames stream in (debounced), and once more on leave.
+  Timer? _markReadDebounce;
   final List<Map<String, dynamic>> _echoes = [];
 
   void _dedupeEchoes() {
@@ -254,6 +260,10 @@ class _ChatPageState extends State<ChatPage> {
   /// Draft-mode (no session yet) model/mode/thought selection, passed as
   /// `config` to createSession on first send.
   final Map<String, String> _draftConfig = {};
+  late final Future<void> _draftConfigReady;
+
+  String get _draftConfigPrefsKey =>
+      'zemote_last_session_config_${widget.workspaceKey}';
 
   /// Whether to keep the view pinned to the newest message. Starts true so
   /// opening the chat lands at the bottom; the user scrolling up unpins it.
@@ -267,6 +277,8 @@ class _ChatPageState extends State<ChatPage> {
     VoiceModelEvents.changed.addListener(_loadVoiceAvailability);
     _sessionId = widget.sessionId;
     _transport = widget.session.conversation(widget.scope);
+    _draftConfigReady = _loadSavedDraftConfig();
+    _transport.modelCatalogChanged.addListener(_onModelCatalogChanged);
     if (_sessionId != null) {
       _subscribe();
     }
@@ -304,7 +316,10 @@ class _ChatPageState extends State<ChatPage> {
     try {
       final prep = await _transport.prepareWorkspace();
       if (mounted) setState(() => _prep = prep);
-    } catch (_) {}
+    } catch (e) {
+      log('[chat] prepareWorkspace failed: $e');
+    }
+    if (!mounted) return;
     setState(() => _skillsLoading = true);
     try {
       final skills = await _transport.skills();
@@ -316,9 +331,18 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
+  void _onModelCatalogChanged() {
+    if (mounted) _loadPrep();
+  }
+
   @override
   void dispose() {
+    _transport.modelCatalogChanged.removeListener(_onModelCatalogChanged);
     _loadingTimer?.cancel();
+    // Leaving the conversation: everything it rendered was seen, so clear any
+    // unread flag the final frames set (e.g. the completion event).
+    _markReadDebounce?.cancel();
+    _markTaskRead();
     _subscription?.dispose();
     VoiceModelEvents.changed.removeListener(_loadVoiceAvailability);
     _voiceTranscriber?.dispose();
@@ -419,6 +443,8 @@ class _ChatPageState extends State<ChatPage> {
       sub.state.addListener(_scrollToBottom);
       sub.state.addListener(_dedupeEchoes);
       sub.state.addListener(_refreshPlanIfNeeded);
+      sub.state.addListener(_scheduleMarkRead);
+      _markTaskRead();
       // Initial snapshots and auto-loaded history can change the list height
       // over multiple frames. Force the first open to the newest message;
       // later streaming updates still use the conditional follow behavior.
@@ -439,6 +465,24 @@ class _ChatPageState extends State<ChatPage> {
       _loadingTimer?.cancel();
       if (mounted) setState(() => _error = '$e');
     }
+  }
+
+  /// New rows arrived while the page is open — the user is watching them, so
+  /// the task must not stay flagged unread on the task/workspace lists.
+  /// Trailing debounce: streaming emits a frame per delta.
+  void _scheduleMarkRead() {
+    if (!mounted || _sessionId == null) return;
+    _markReadDebounce?.cancel();
+    _markReadDebounce =
+        Timer(const Duration(milliseconds: 1500), _markTaskRead);
+  }
+
+  void _markTaskRead() {
+    final sessionId = _sessionId;
+    if (sessionId == null) return;
+    widget.session.channels.call(Channels.zcodeTask, 'setTaskUnread', [
+      {...widget.scope, 'taskId': sessionId, 'unread': false},
+    ]).catchError((Object e) => log('[chat] mark read failed: $e'));
   }
 
   /// Clears the loading watchdog once the first snapshot lands.
@@ -683,8 +727,16 @@ class _ChatPageState extends State<ChatPage> {
     _stickToBottom = true;
     _scrollToBottom();
     try {
+      await _draftConfigReady;
+      if (!mounted) return;
+      final submission = await _resolveSubmissionConfig();
+      echo['submissionConfig'] = submission;
       var sessionId = _sessionId;
       if (sessionId == null) {
+        // Restore the last explicit model/mode selection before creating the
+        // first session, even when the user sends immediately after opening.
+        await _draftConfigReady;
+        if (!mounted) return;
         // 1) create the session (can take a while when the runtime warms)
         setState(() => _progress = '正在创建会话（首次可能需要预热）…');
         final sw = Stopwatch()..start();
@@ -700,7 +752,7 @@ class _ChatPageState extends State<ChatPage> {
           sessionId = await _transport.createSession(
             widget.workspaceKey,
             firstText: canUseFirstInput ? text : null,
-            config: _buildDraftConfig(),
+            config: submission,
             timeout: const Duration(seconds: 90),
           );
           if (!mounted) return;
@@ -716,6 +768,7 @@ class _ChatPageState extends State<ChatPage> {
         if (canUseFirstInput) {
           // Message already sent with the session; just display history.
           echo['status'] = 'sent';
+          unawaited(_rememberSubmission(submission));
           _inputController.clear();
           setState(() => _pendingFiles.clear());
           _subscribe();
@@ -729,6 +782,7 @@ class _ChatPageState extends State<ChatPage> {
         final res = await _transport.sendGoalCommand(
           sessionId,
           text.substring('/goal '.length).trim(),
+          submissionConfig: submission,
           heldQueueDisposition: heldDisposition,
         );
         if (_ackRejected(res)) {
@@ -738,6 +792,7 @@ class _ChatPageState extends State<ChatPage> {
           return;
         }
         echo['status'] = 'sent';
+        unawaited(_rememberSubmission(submission));
         _inputController.clear();
         return;
       }
@@ -753,6 +808,7 @@ class _ChatPageState extends State<ChatPage> {
         sessionId,
         text,
         attachments: attachments,
+        submissionConfig: submission,
         heldQueueDisposition: heldDisposition,
       );
       if (_ackRejected(res)) {
@@ -762,6 +818,7 @@ class _ChatPageState extends State<ChatPage> {
         return;
       }
       echo['status'] = 'sent';
+      unawaited(_rememberSubmission(submission));
       _inputController.clear();
       setState(() => _pendingFiles.clear());
     } catch (e) {
@@ -803,15 +860,19 @@ class _ChatPageState extends State<ChatPage> {
         echo['attachments'] = attachments;
       }
       final text = '${echo['text'] ?? ''}';
+      final submission = await _resolveSubmissionConfig(
+          saved: echo['submissionConfig'] as Map<String, dynamic>?);
       final res = echo['isGoal'] == true
           ? await _transport.sendGoalCommand(
               sessionId,
               text.substring('/goal '.length).trim(),
+              submissionConfig: submission,
             )
           : await _transport.sendText(
               sessionId,
               text,
               attachments: attachments,
+              submissionConfig: submission,
             );
       if (_ackRejected(res)) {
         throw StateError(_ackReason(res));
@@ -848,25 +909,93 @@ class _ChatPageState extends State<ChatPage> {
     return sessionId;
   }
 
-  /// Builds the createSession `config` payload from the draft selection.
-  Map<String, dynamic>? _buildDraftConfig() {
-    if (_draftConfig.isEmpty) return null;
-    final config = <String, dynamic>{};
-    final modelValue = _draftConfig['model'];
-    if (modelValue != null && modelValue.isNotEmpty) {
-      final idx = modelValue.lastIndexOf('/');
-      if (idx > 0) {
-        config['provider'] = modelValue.substring(0, idx);
-        config['model'] = modelValue.substring(idx + 1);
-      }
+  ModelSelection? get _composerSelection {
+    final explicit = ModelSelection.fromValue(
+        _draftConfig['model'], _draftConfig['thought']);
+    if (explicit != null) return explicit;
+    final state = _state;
+    return state?.currentSelection ??
+        (state?.currentModel.isNotEmpty == true
+            ? ModelSelection('${state?.config?['provider'] ?? ''}',
+                state!.currentModel, state.currentThought)
+            : _prep?.modelView?.preferredSelection);
+  }
+
+  Future<Map<String, dynamic>> _resolveSubmissionConfig(
+      {Map<String, dynamic>? saved}) async {
+    if (_prep == null) {
+      final prep = await _transport.prepareWorkspace();
+      if (mounted) setState(() => _prep = prep);
     }
-    if (_draftConfig['thought'] != null) {
-      config['thought'] = _draftConfig['thought'];
+    final selection = saved == null
+        ? _composerSelection
+        : ModelSelection.fromJson(saved['modelSelection']);
+    final view = await _transport.modelSelection(selection: selection);
+    final effective = view.requireEffectiveSelection();
+    final mode = saved?['mode'] ??
+        _draftConfig['mode'] ??
+        _state?.currentMode ??
+        'build';
+    return {
+      'modelSelection': effective.toJson(),
+      'mode': mode == 'plan' ? 'build' : mode,
+      'planEnabled': saved?['planEnabled'] ??
+          (_draftConfig.containsKey('planEnabled')
+              ? _draftConfig['planEnabled'] == 'true'
+              : (_state?.config?['planEnabled'] == true || mode == 'plan')),
+    };
+  }
+
+  String get _composerPrefsKey =>
+      "zemote_composer_${widget.workspaceKey}_${_sessionId ?? 'draft'}";
+
+  Future<void> _loadSavedDraftConfig() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getString(_composerPrefsKey) ??
+          (_sessionId == null ? prefs.getString(_draftConfigPrefsKey) : null);
+      if (saved == null) return;
+      final decoded = jsonDecode(saved);
+      if (decoded is! Map || !mounted) return;
+      setState(() {
+        for (final key in const ['model', 'mode', 'thought', 'planEnabled']) {
+          final value = decoded[key];
+          if (value is String && value.isNotEmpty) {
+            _draftConfig.putIfAbsent(key, () => value);
+          }
+        }
+      });
+    } catch (e) {
+      log('[chat] restore last session config failed: $e');
     }
-    if (_draftConfig['mode'] != null) {
-      config['mode'] = _draftConfig['mode'];
+  }
+
+  Future<void> _saveComposerDraft() async {
+    final key = _composerPrefsKey;
+    final encoded = jsonEncode(_draftConfig);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(key, encoded);
+    } catch (e) {
+      log('[chat] save composer config failed: $e');
     }
-    return config.isEmpty ? null : config;
+  }
+
+  Future<void> _rememberSubmission(Map<String, dynamic> submission) async {
+    final selection = ModelSelection.fromJson(submission['modelSelection']);
+    if (selection == null) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+          _draftConfigPrefsKey,
+          jsonEncode({
+            'model': selection.value,
+            'thought': selection.reasoningLevel,
+            'mode': submission['mode'],
+          }));
+    } catch (e) {
+      log('[chat] save last session config failed: $e');
+    }
   }
 
   Future<String?> _askHeldQueueDisposition() {
@@ -949,15 +1078,20 @@ class _ChatPageState extends State<ChatPage> {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      builder: (context) => _ModelModeSheet(
-        state: _state,
-        transport: _transport,
-        prep: _prep,
-        sessionId: _sessionId,
-        draftConfig: _draftConfig,
-        onDraftChange: (key, value) {
-          setState(() => _draftConfig[key] = value);
-        },
+      builder: (context) => SizedBox(
+        width: MediaQuery.sizeOf(context).width,
+        child: _ModelModeSheet(
+          state: _state,
+          transport: _transport,
+          prep: _prep,
+          sessionId: _sessionId,
+          draftConfig: _draftConfig,
+          onDraftChange: (key, value) {
+            setState(() => _draftConfig[key] = value);
+            unawaited(_saveComposerDraft());
+          },
+          onPrepRefresh: _loadPrep,
+        ),
       ),
     );
   }
@@ -1058,7 +1192,9 @@ class _ChatPageState extends State<ChatPage> {
   void _refreshPlanIfNeeded() {
     final state = _state;
     final sessionId = _sessionId;
-    if (state == null || sessionId == null || state.currentMode != 'plan') {
+    if (state == null ||
+        sessionId == null ||
+        state.currentMode != 'plan' && state.config?['planEnabled'] != true) {
       return;
     }
     if (_planRevision == state.revision || _planLoading) return;
@@ -2576,7 +2712,9 @@ class _PlanBanner extends StatelessWidget {
       snapshotPlan: state.plan,
       rpcPlan: rpcPlan,
     );
-    if ((steps == null || steps.isEmpty) && state.currentMode != 'plan') {
+    if ((steps == null || steps.isEmpty) &&
+        state.currentMode != 'plan' &&
+        state.config?['planEnabled'] != true) {
       return const SizedBox.shrink();
     }
     final visibleSteps = steps ?? const <PlanStep>[];
@@ -3698,13 +3836,14 @@ class _QuestionItemState extends State<_QuestionItem> {
 
 // ---------------------------------------------------------------- sheets
 
-class _ModelModeSheet extends StatelessWidget {
+class _ModelModeSheet extends StatefulWidget {
   final ConversationState? state;
   final ConversationTransport transport;
   final WorkspacePrep? prep;
   final String? sessionId;
   final Map<String, String>? draftConfig;
   final void Function(String key, String value)? onDraftChange;
+  final Future<void> Function()? onPrepRefresh;
 
   const _ModelModeSheet({
     required this.state,
@@ -3713,327 +3852,193 @@ class _ModelModeSheet extends StatelessWidget {
     this.sessionId,
     this.draftConfig,
     this.onDraftChange,
+    this.onPrepRefresh,
   });
 
-  bool get _isDraft => sessionId == null || sessionId!.isEmpty;
+  @override
+  State<_ModelModeSheet> createState() => _ModelModeSheetState();
+}
 
-  /// Config options beyond the model/mode/thought selects (e.g. max output
-  /// length, search enhancement) surfaced read-only from prepareWorkspace.
-  List<ConfigOption> get _otherOptions {
-    const known = {'model', 'mode', 'thought_level'};
-    final options = prep?.configOptions;
-    if (options == null) return const [];
-    return options.where((o) => !known.contains(o.id)).toList();
+class _ModelModeSheetState extends State<_ModelModeSheet> {
+  WorkspacePrep? _livePrep;
+  bool _refreshing = false;
+  String? _error;
+  WorkspacePrep? get _prep => _livePrep ?? widget.prep;
+  bool get _isDraft => widget.sessionId == null;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.transport.modelCatalogChanged.addListener(_catalogChanged);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _refresh());
   }
 
-  /// 'builtin:zai-coding-plan/GLM-5.2' → (provider, model)
-  (String, String) _splitModelValue(String value) {
-    final idx = value.lastIndexOf('/');
-    if (idx <= 0) return (value, value);
-    return (value.substring(0, idx), value.substring(idx + 1));
+  @override
+  void dispose() {
+    widget.transport.modelCatalogChanged.removeListener(_catalogChanged);
+    super.dispose();
+  }
+
+  void _catalogChanged() {
+    if (mounted) _refresh();
+  }
+
+  Future<void> _refresh() async {
+    if (!mounted || _refreshing) return;
+    setState(() {
+      _refreshing = true;
+      _error = null;
+    });
+    try {
+      final prep = await widget.transport.prepareWorkspace(refresh: true);
+      if (mounted) setState(() => _livePrep = prep);
+    } catch (e) {
+      if (mounted) setState(() => _error = '加载失败: $e');
+    } finally {
+      if (mounted) setState(() => _refreshing = false);
+    }
+  }
+
+  ModelSelection? get _selection =>
+      ModelSelection.fromValue(
+          widget.draftConfig?['model'], widget.draftConfig?['thought']) ??
+      widget.state?.currentSelection ??
+      (widget.state?.currentModel.isNotEmpty == true
+          ? ModelSelection('${widget.state?.config?['provider'] ?? ''}',
+              widget.state!.currentModel, widget.state!.currentThought)
+          : _prep?.modelView?.preferredSelection);
+
+  void _set(String key, String value) {
+    widget.onDraftChange?.call(key, value);
+    setState(() {});
+  }
+
+  void _selectModel(SelectableModel model) {
+    final selected = model.defaultSelection;
+    widget.onDraftChange?.call('model', selected.value);
+    widget.onDraftChange?.call('thought', selected.reasoningLevel ?? '');
+    setState(() {});
   }
 
   @override
   Widget build(BuildContext context) {
-    final sid = sessionId ?? '';
-    final config = state?.config ?? const {};
-    final modelOption = prep?.option('model');
-    final modeOption = prep?.option('mode');
-    final thoughtOption = prep?.option('thought_level');
-    final followup = '${config['followupMode'] ?? 'queue'}';
-
-    // Current selection: prefer the LIVE session config (updates after a
-    // switch), fall back to prepareWorkspace's currentValue / draft.
-    final liveModelValue =
-        '${config['provider'] ?? ''}/${config['model'] ?? ''}';
-    final currentModelValue =
-        _isDraft || config['model'] == null || '${config['model']}'.isEmpty
-            ? (draftConfig?['model'] ?? '${modelOption?.currentValue ?? ''}')
-            : liveModelValue;
-    final currentThoughtValue = _isDraft
-        ? (draftConfig?['thought'] ?? '${thoughtOption?.currentValue ?? ''}')
-        : (state?.currentThought.isNotEmpty == true
-            ? state!.currentThought
-            : '${thoughtOption?.currentValue ?? ''}');
-    final currentModeValue = _isDraft
-        ? (draftConfig?['mode'] ?? 'build')
-        : state?.currentMode ?? 'build';
-
+    final selection = _selection;
+    final view = _prep?.modelView;
+    final levels = view?.model(selection?.value)?.reasoningLevels ?? <String>[];
+    final mode =
+        widget.draftConfig?['mode'] ?? widget.state?.currentMode ?? 'build';
+    final plan = widget.draftConfig?['planEnabled'] != null
+        ? widget.draftConfig!['planEnabled'] == 'true'
+        : widget.state?.config?['planEnabled'] == true || mode == 'plan';
     return SafeArea(
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.all(20),
-        child: Column(
+        child: SingleChildScrollView(
+      padding: const EdgeInsets.all(20),
+      child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(_isDraft ? '新会话 · 模型与模式' : '模型与模式',
-                style:
-                    const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
-            const SizedBox(height: 16),
-            if (modelOption != null && modelOption.options.isNotEmpty) ...[
-              Text(modelOption.name, style: const TextStyle(fontSize: 13)),
-              const SizedBox(height: 8),
-              for (final v in modelOption.options)
-                ListTile(
-                  dense: true,
-                  contentPadding: EdgeInsets.zero,
-                  leading: Icon(
-                    currentModelValue == v.value
+            Row(children: [
+              Expanded(
+                  child: Text('模型与模式',
+                      style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                          color: ZInk.solid(context)))),
+              IconButton(
+                  onPressed: _refreshing ? null : _refresh,
+                  icon: const Icon(Icons.refresh),
+                  tooltip: '刷新模型列表'),
+            ]),
+            Text('应用于下一条消息',
+                style: TextStyle(fontSize: 12, color: ZInk.muted(context))),
+            if (_refreshing) const LinearProgressIndicator(),
+            if (_error != null)
+              Text(_error!, style: const TextStyle(color: ZColors.danger)),
+            if (view != null && view.models.isEmpty)
+              const Text('暂无可用模型，请在模型供应商中配置'),
+            if (selection != null && view != null && !view.supports(selection))
+              const Text('当前模型或思考等级已不可用，请重新选择',
+                  style: TextStyle(color: ZColors.danger)),
+            for (final model in view?.models ?? <SelectableModel>[])
+              ListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                leading: Icon(
+                    selection?.value == model.value
                         ? Icons.radio_button_checked
                         : Icons.radio_button_off,
                     size: 18,
-                    color: currentModelValue == v.value
+                    color: selection?.value == model.value
                         ? ZColors.primary
-                        : ZInk.ghost(context),
-                  ),
-                  title: Text(v.name, style: const TextStyle(fontSize: 13)),
-                  subtitle: v.modelProviderName != null
-                      ? Text(v.modelProviderName!,
-                          style: TextStyle(
-                              fontSize: 11, color: ZInk.faint(context)))
-                      : null,
-                  onTap: () {
-                    if (_isDraft) {
-                      onDraftChange?.call('model', v.value);
-                    } else {
-                      final (provider, model) = _splitModelValue(v.value);
-                      // thought must be valid for the target model:
-                      // keep current if supported, else fall back to the
-                      // thought option's currentValue (Turbo: enabled/off)
-                      final currentThought = state?.currentThought ?? '';
-                      final thoughtOpt = prep?.option('thought_level');
-                      final thought = currentThought.isNotEmpty &&
-                              (thoughtOpt?.options
-                                      .any((o) => o.value == currentThought) ??
-                                  false)
-                          ? currentThought
-                          : '${thoughtOpt?.currentValue ?? (currentThought.isNotEmpty ? currentThought : 'enabled')}';
-                      _apply(
-                        context,
-                        () => transport.switchModelConfig(
-                          sid,
-                          provider: provider,
-                          model: model,
-                          thought: thought,
-                        ),
-                        onAccepted: () => state?.optimisticPatch({
-                          'config': {
-                            ...?state!.config,
-                            'provider': provider,
-                            'model': model,
-                            'thought': thought,
-                          },
-                        }),
-                      );
-                    }
-                  },
-                ),
+                        : ZInk.ghost(context)),
+                title: Text(model.modelId,
+                    style: TextStyle(fontSize: 13, color: ZInk.solid(context))),
+                subtitle: Text(model.providerName,
+                    style: TextStyle(fontSize: 11, color: ZInk.muted(context))),
+                onTap: () => _selectModel(model),
+              ),
+            if (levels.isNotEmpty) ...[
               const SizedBox(height: 12),
-            ] else
-              Text('当前模型: ${state?.currentModel ?? ''}',
-                  style: TextStyle(fontSize: 12, color: ZInk.muted(context))),
-            if (thoughtOption != null && thoughtOption.options.isNotEmpty) ...[
-              Text(thoughtOption.name, style: const TextStyle(fontSize: 13)),
-              const SizedBox(height: 8),
-              Wrap(
-                spacing: 8,
-                children: [
-                  for (final v in thoughtOption.options)
-                    ChoiceChip(
-                      label: Text(v.name),
-                      selected: currentThoughtValue == v.value ||
-                          state?.currentThought == v.value,
-                      onSelected: (_) {
-                        if (_isDraft) {
-                          onDraftChange?.call('thought', v.value);
-                        } else {
-                          final modelValue = currentModelValue;
-                          final (provider, model) = modelValue.isNotEmpty
-                              ? _splitModelValue(modelValue)
-                              : (
-                                  '${config['provider'] ?? ''}',
-                                  '${config['model'] ?? ''}'
-                                );
-                          _apply(
-                            context,
-                            () => transport.switchModelConfig(
-                              sid,
-                              provider: provider,
-                              model: model,
-                              thought: v.value,
-                            ),
-                            onAccepted: () => state?.optimisticPatch({
-                              'config': {
-                                ...?state!.config,
-                                'thought': v.value,
-                              },
-                            }),
-                          );
-                        }
-                      },
-                    ),
-                ],
-              ),
-            ] else if ((state?.thoughtLevels ?? const []).isNotEmpty) ...[
-              const Text('思考等级', style: TextStyle(fontSize: 13)),
-              const SizedBox(height: 8),
-              Wrap(
-                spacing: 8,
-                children: [
-                  for (final level in state!.thoughtLevels)
-                    ChoiceChip(
+              const Text('思考等级'),
+              Wrap(spacing: 8, children: [
+                for (final level in levels)
+                  ChoiceChip(
                       label: Text(level),
-                      selected: state?.currentThought == level,
-                      onSelected: (_) => _apply(
-                        context,
-                        () => transport.switchModelConfig(
-                          sid,
-                          provider: '${config['provider'] ?? ''}',
-                          model: '${config['model'] ?? ''}',
-                          thought: level,
-                        ),
-                      ),
-                    ),
-                ],
-              ),
+                      selected: selection?.reasoningLevel == level,
+                      onSelected: (_) {
+                        widget.onDraftChange?.call('model', selection!.value);
+                        _set('thought', level);
+                      }),
+              ]),
             ],
             const SizedBox(height: 16),
-            const Text('协作模式', style: TextStyle(fontSize: 13)),
-            const SizedBox(height: 8),
-            if (modeOption != null && modeOption.options.isNotEmpty)
-              for (final v in modeOption.options)
-                ListTile(
-                  dense: true,
-                  contentPadding: EdgeInsets.zero,
-                  leading: Icon(
-                    currentModeValue == v.value
-                        ? Icons.radio_button_checked
-                        : Icons.radio_button_off,
-                    size: 18,
-                    color: currentModeValue == v.value
-                        ? ZColors.primary
-                        : ZInk.ghost(context),
-                  ),
-                  title: Text(v.name, style: const TextStyle(fontSize: 13)),
-                  subtitle: v.description != null
-                      ? Text(v.description!,
-                          style: TextStyle(
-                              fontSize: 11, color: ZInk.faint(context)))
-                      : null,
-                  onTap: () {
-                    if (_isDraft) {
-                      onDraftChange?.call('mode', v.value);
-                    } else {
-                      _apply(
-                        context,
-                        () => transport.switchCollaborationMode(sid, v.value),
-                        onAccepted: () => state?.optimisticPatch({
-                          'config': {
-                            ...?state!.config,
-                            'mode': v.value,
-                          },
-                        }),
-                      );
-                    }
-                  },
-                )
-            else
-              Wrap(
-                spacing: 8,
-                children: [
-                  for (final m in const ['build', 'edit', 'plan', 'yolo'])
-                    ChoiceChip(
-                      label: Text(m),
-                      selected: currentModeValue == m,
-                      onSelected: (_) {
-                        if (_isDraft) {
-                          onDraftChange?.call('mode', m);
-                        } else {
-                          _apply(
-                            context,
-                            () => transport.switchCollaborationMode(sid, m),
-                          );
-                        }
-                      },
-                    ),
-                ],
-              ),
+            const Text('协作模式'),
+            Wrap(spacing: 8, children: [
+              for (final item in const [
+                ('build', '变更前确认'),
+                ('edit', '自动编辑'),
+                ('yolo', '完全访问')
+              ])
+                ChoiceChip(
+                    label: Text(item.$2),
+                    selected: (mode == 'plan' ? 'build' : mode) == item.$1,
+                    onSelected: (_) => _set('mode', item.$1)),
+            ]),
+            SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('计划模式'),
+                value: plan,
+                onChanged: (on) => _set('planEnabled', '$on')),
             if (!_isDraft) ...[
-              const SizedBox(height: 16),
-              const Text('后续消息', style: TextStyle(fontSize: 13)),
-              const SizedBox(height: 8),
-              Wrap(
-                spacing: 8,
-                children: [
-                  for (final f in const ['queue', 'guide'])
-                    ChoiceChip(
-                      label: Text(f == 'queue' ? '排队' : '引导'),
-                      selected: followup == f,
-                      onSelected: (_) => _apply(
-                        context,
-                        () => transport.setFollowupMode(sid, f),
-                        onAccepted: () => state?.optimisticPatch({
-                          'config': {
-                            ...?state!.config,
-                            'followupMode': f,
-                          },
-                        }),
-                      ),
-                    ),
-                ],
-              ),
+              const Text('后续消息'),
+              Wrap(spacing: 8, children: [
+                for (final value in const ['queue', 'guide'])
+                  ChoiceChip(
+                      label: Text(value == 'queue' ? '排队' : '引导'),
+                      selected:
+                          (widget.state?.config?['followupMode'] ?? 'queue') ==
+                              value,
+                      onSelected: (_) => _setFollowup(value)),
+              ]),
             ],
-            if (_otherOptions.isNotEmpty) ...[
-              const SizedBox(height: 16),
-              const Text('其他配置', style: TextStyle(fontSize: 13)),
-              const SizedBox(height: 8),
-              for (final o in _otherOptions)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 8),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Expanded(
-                        child:
-                            Text(o.name, style: const TextStyle(fontSize: 13)),
-                      ),
-                      const SizedBox(width: 8),
-                      Text('${o.currentValue}',
-                          style: TextStyle(
-                              fontSize: 12, color: ZInk.muted(context))),
-                    ],
-                  ),
-                ),
-            ],
-          ],
-        ),
-      ),
-    );
+          ]),
+    ));
   }
 
-  Future<void> _apply(
-    BuildContext context,
-    Future<dynamic> Function() run, {
-    void Function()? onAccepted,
-  }) async {
+  Future<void> _setFollowup(String value) async {
     try {
-      final res = await run();
-      if (context.mounted) {
-        if (res is Map &&
-            res['status'] != null &&
-            res['status'] != 'accepted') {
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-              content: Text('被拒绝: ${res['reasonCode'] ?? res['status']}')));
-        } else {
-          onAccepted?.call();
-          Navigator.pop(context);
-        }
+      final res =
+          await widget.transport.setFollowupMode(widget.sessionId!, value);
+      if (res is Map &&
+          !['accepted', 'noop', 'duplicate'].contains(res['status'])) {
+        throw StateError('${res['reasonCode'] ?? res['status']}');
       }
+      widget.state?.optimisticPatch({
+        'config': {...?widget.state?.config, 'followupMode': value}
+      });
+      if (mounted) setState(() {});
     } catch (e) {
-      if (context.mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('失败: $e')));
-      }
+      if (mounted) setState(() => _error = '设置失败: $e');
     }
   }
 }

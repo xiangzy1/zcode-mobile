@@ -34,6 +34,12 @@ class ThemeController extends ChangeNotifier {
   }
 }
 
+/// M3 clamps modal bottom sheets to 640px and centers them, leaving empty
+/// margins on tablets/desktop. Sheets should span the window instead. The
+/// bound must stay FINITE: bottom-sheet content like `SingleChildScrollView`
+/// shrink-wraps its cross axis when maxWidth is unbounded.
+const kSheetMaxWidth = 100000.0;
+
 class ZColors {
   static const primary = Color(0xFF3B82F6);
   static const primaryDim = Color(0xFF2563EB);
@@ -196,6 +202,7 @@ ThemeData buildDarkTheme() {
     ),
     bottomSheetTheme: const BottomSheetThemeData(
       backgroundColor: ZColors.darkSurface,
+      constraints: BoxConstraints(maxWidth: kSheetMaxWidth),
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
@@ -228,7 +235,10 @@ ThemeData buildDarkTheme() {
       selectedColor: ZColors.primary.withValues(alpha: 0.18),
       side: const BorderSide(color: ZColors.darkBorder),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-      labelStyle: const TextStyle(fontSize: 12),
+      // Explicit ink: without a color the label inherits the ambient
+      // DefaultTextStyle, which is not guaranteed to contrast with the chip
+      // fill (this is how light-theme chip labels ended up white-on-gray).
+      labelStyle: const TextStyle(fontSize: 12, color: Colors.white),
       padding: const EdgeInsets.symmetric(horizontal: 6),
     ),
     filledButtonTheme: FilledButtonThemeData(
@@ -307,6 +317,7 @@ ThemeData buildLightTheme() {
     ),
     bottomSheetTheme: const BottomSheetThemeData(
       backgroundColor: ZColors.lightSurface,
+      constraints: BoxConstraints(maxWidth: kSheetMaxWidth),
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
@@ -339,7 +350,9 @@ ThemeData buildLightTheme() {
       selectedColor: ZColors.primary.withValues(alpha: 0.12),
       side: const BorderSide(color: ZColors.lightBorder),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-      labelStyle: const TextStyle(fontSize: 12),
+      // Explicit slate ink: without a color the label inherited the white
+      // bodyMedium default and rendered invisible on the light chip fill.
+      labelStyle: const TextStyle(fontSize: 12, color: ZInk._slate700),
       padding: const EdgeInsets.symmetric(horizontal: 6),
     ),
     filledButtonTheme: FilledButtonThemeData(

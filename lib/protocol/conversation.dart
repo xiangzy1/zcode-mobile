@@ -7,10 +7,12 @@ import 'package:flutter/foundation.dart';
 
 import 'channel_client.dart';
 import 'id.dart';
+import 'model_selection.dart';
+export 'model_selection.dart';
 import 'zemote_client.dart';
 
 /// Conversation V4 protocol over the `zcode-agent` channel.
-const conversationProtocolAppVersion = '3.6.5';
+const conversationProtocolAppVersion = 'unknown';
 
 ///
 /// Flow (mirrors `sk()`/`uk()` in the web client):
@@ -41,9 +43,8 @@ class ConversationTransport {
   ConversationTransport({
     required this.session,
     required this.scope,
-    // This is the desktop Conversation protocol capability version, not the
-    // Zemote release version. Sending 0.x here can disable V4 capabilities
-    // such as sessions-index during server negotiation.
+    // The current web client sends unknown and negotiates capabilities via
+    // helloConversationV4, rather than pretending to be a desktop release.
     this.appVersion = conversationProtocolAppVersion,
     this.onLog,
   }) {
@@ -57,6 +58,11 @@ class ConversationTransport {
     _handshakeFuture = null;
     connectionId = null;
     _prep = null;
+    _prepFuture = null;
+    _cancelModelListener?.call();
+    _cancelModelListener = null;
+    _watchModels();
+    modelCatalogChanged.value++;
   }
 
   ChannelClient get _channels => session.channels;
@@ -76,7 +82,7 @@ class ConversationTransport {
           'kind': 'clientHello',
           'protocolVersion': 3,
           'clientId': clientId,
-          'clientKind': 'mobileApp',
+          'clientKind': 'web',
           'appVersion': appVersion,
         },
       ]);
@@ -119,8 +125,6 @@ class ConversationTransport {
     'reorderQueueItem',
     'deleteQueueItem',
     'setAutoDrain',
-    'switchModelConfig',
-    'switchCollaborationMode',
     'setFollowupMode',
     'pauseGoal',
     'resumeGoal',
@@ -253,7 +257,6 @@ class ConversationTransport {
     String? firstText,
     List<Map<String, dynamic>>? attachments,
     Map<String, dynamic>? config,
-    String? runtimeModel,
     List<String>? mcpServers,
     Duration timeout = const Duration(seconds: 90),
   }) async {
@@ -265,11 +268,12 @@ class ConversationTransport {
         if (firstText != null)
           'firstInput': {
             'text': firstText,
+            for (final key in const ['modelSelection', 'mode', 'planEnabled'])
+              if (config?.containsKey(key) == true) key: config![key],
             if (attachments != null && attachments.isNotEmpty)
               'attachments': attachments,
           },
         if (config != null) 'config': config,
-        if (runtimeModel != null) 'runtimeModel': runtimeModel,
         if (mcpServers != null && mcpServers.isNotEmpty)
           'mcpServers': mcpServers,
       },
@@ -321,6 +325,7 @@ class ConversationTransport {
     String sessionId,
     String text, {
     List<Map<String, dynamic>>? attachments,
+    Map<String, dynamic>? submissionConfig,
     String? heldQueueDisposition,
     List<String>? expectedHeldQueueItemIds,
     String? automationId,
@@ -330,6 +335,7 @@ class ConversationTransport {
     List<String>? toolDisallowlist,
   }) =>
       sendCommand(sessionId, 'sendText', {
+        ...?submissionConfig,
         'text': text,
         if (attachments != null && attachments.isNotEmpty)
           'attachments': attachments,
@@ -350,10 +356,12 @@ class ConversationTransport {
     String sessionId,
     String text, {
     String? displayText,
+    Map<String, dynamic>? submissionConfig,
     String? heldQueueDisposition,
     List<String>? expectedHeldQueueItemIds,
   }) =>
       sendCommand(sessionId, 'sendGoalCommand', {
+        ...?submissionConfig,
         'text': text,
         if (displayText != null) 'displayText': displayText,
         if (heldQueueDisposition != null)
@@ -373,40 +381,6 @@ class ConversationTransport {
 
   Future<dynamic> compact(String sessionId) =>
       sendCommand(sessionId, 'compact', {});
-
-  /// Switch model config. All of provider/model/thought are required by the
-  /// protocol schema — pass current values for the ones not changing.
-  /// Thought levels differ per model family (GLM-5.2: max/high/nothink;
-  /// Turbo: enabled/off), so on `Unsupported reasoning effort` we retry
-  /// with the other family's default.
-  Future<dynamic> switchModelConfig(
-    String sessionId, {
-    required String provider,
-    required String model,
-    required String thought,
-  }) async {
-    var res = await sendCommand(sessionId, 'switchModelConfig', {
-      'provider': provider,
-      'model': model,
-      'thought': thought,
-    });
-    final message = res is Map ? '${res['message'] ?? ''}' : '';
-    if (message.contains('Unsupported reasoning effort')) {
-      final fallback =
-          (thought == 'enabled' || thought == 'off') ? 'max' : 'enabled';
-      _log('[v4] switchModelConfig retry with thought=$fallback');
-      res = await sendCommand(sessionId, 'switchModelConfig', {
-        'provider': provider,
-        'model': model,
-        'thought': fallback,
-      });
-    }
-    return res;
-  }
-
-  /// build / edit / plan / yolo. Mirrors `switchCollaborationMode`.
-  Future<dynamic> switchCollaborationMode(String sessionId, String mode) =>
-      sendCommand(sessionId, 'switchCollaborationMode', {'mode': mode});
 
   /// queue / guide followup. Mirrors `setFollowupMode`.
   Future<dynamic> setFollowupMode(String sessionId, String mode) =>
@@ -674,20 +648,68 @@ class ConversationTransport {
   // ---------------------------------------------------- workspace config
 
   WorkspacePrep? _prep;
+  Future<WorkspacePrep>? _prepFuture;
 
-  /// `zcode-task.prepareWorkspace` — returns configOptions (model/mode/
-  /// thought selects) and slashCommands (builtin + custom skills/MCP).
+  final modelCatalogChanged = ValueNotifier<int>(0);
+  void Function()? _cancelModelListener;
+
+  void _watchModels() {
+    _cancelModelListener ??= _channels.addEventListener(
+      Channels.modelSelection,
+      'onDidChange',
+      (_) {
+        _prep = null;
+        modelCatalogChanged.value++;
+      },
+    );
+  }
+
+  Future<ModelSelectionView> modelSelection({ModelSelection? selection}) async {
+    _watchModels();
+    final raw = await _channels.call(Channels.modelSelection, 'getView', [
+      {'selection': selection?.toJson()},
+    ]);
+    if (raw is! Map)
+      throw const FormatException('Invalid model-selection view');
+    return ModelSelectionView(raw);
+  }
+
+  /// Current web workspace catalog: presentation and model selection are
+  /// separate services. Do not call the removed zcode-task.prepareWorkspace.
   Future<WorkspacePrep> prepareWorkspace({bool refresh = false}) async {
     final cached = _prep;
     if (cached != null && !refresh) return cached;
-    final res = await _channels.call(
-      Channels.zcodeTask,
-      'prepareWorkspace',
-      [scope],
-    );
-    final prep = WorkspacePrep._(res is Map ? res : const {});
-    _prep = prep;
-    return prep;
+    final inFlight = _prepFuture;
+    if (inFlight != null) return inFlight;
+    final future = () async {
+      while (true) {
+        final generation = modelCatalogChanged.value;
+        final results = await Future.wait<dynamic>([
+          _channels.call(
+              Channels.zcodeSession, 'readWorkspacePresentation', [scope]),
+          modelSelection(),
+        ]);
+        if (modelCatalogChanged.value != generation) continue;
+        if (results[0] is! Map)
+          throw const FormatException('Invalid workspace presentation');
+        final prep = WorkspacePrep.fromWeb(
+            results[0] as Map, results[1] as ModelSelectionView);
+        _prep = prep;
+        return prep;
+      }
+    }();
+    _prepFuture = future;
+    try {
+      return await future;
+    } finally {
+      if (identical(_prepFuture, future)) _prepFuture = null;
+    }
+  }
+
+  void dispose() {
+    session.recovered.removeListener(_onBridgeRecovered);
+    _cancelModelListener?.call();
+    modelCatalogChanged.dispose();
   }
 
   /// `skills.list` — enabled skills of this workspace (mirrors the web
@@ -1076,11 +1098,12 @@ class ConversationSubscription extends _SubscriptionBase<ConversationState> {
 }
 
 class WorkspacePrep {
+  final ModelSelectionView? modelView;
   final List<ConfigOption> configOptions;
   final List<SlashCommand> slashCommands;
   final Map raw;
 
-  WorkspacePrep._(this.raw)
+  WorkspacePrep._(this.raw, {this.modelView})
       : configOptions = [
           if (raw['configOptions'] is List)
             for (final o in raw['configOptions'] as List)
@@ -1091,6 +1114,54 @@ class WorkspacePrep {
             for (final c in raw['slashCommands'] as List)
               if (c is Map) SlashCommand._(c),
         ];
+
+  factory WorkspacePrep.fromWeb(Map presentation, ModelSelectionView view) {
+    final selected = view.effectiveSelection ?? view.preferredSelection;
+    final model = view.model(selected?.value);
+    return WorkspacePrep._({
+      'slashCommands': presentation['slashCommands'],
+      'configOptions': [
+        {
+          'id': 'model',
+          'name': '模型',
+          'category': 'model',
+          'type': 'select',
+          'currentValue': selected?.value ?? '',
+          'options': [
+            for (final m in view.models)
+              {
+                'value': m.value,
+                'name': m.modelId,
+                'modelProviderName': m.providerName,
+              }
+          ],
+        },
+        {
+          'id': 'thought_level',
+          'name': '思考等级',
+          'category': 'thought_level',
+          'type': 'select',
+          'currentValue': selected?.reasoningLevel ?? '',
+          'options': [
+            for (final level in model?.reasoningLevels ?? <String>[])
+              {'value': level, 'name': level}
+          ],
+        },
+        {
+          'id': 'mode',
+          'name': '协作模式',
+          'category': 'mode',
+          'type': 'select',
+          'currentValue': presentation['mode'] ?? 'build',
+          'options': [
+            {'value': 'build', 'name': '变更前确认'},
+            {'value': 'edit', 'name': '自动编辑'},
+            {'value': 'yolo', 'name': '完全访问'},
+          ],
+        },
+      ],
+    }, modelView: view);
+  }
 
   ConfigOption? option(String id) {
     for (final o in configOptions) {
@@ -1552,8 +1623,12 @@ class ConversationState extends ChangeNotifier {
   Map<String, dynamic>? get config =>
       (snapshot?['config'] as Map?)?.cast<String, dynamic>();
 
-  String get currentModel => config?['model'] as String? ?? '';
-  String get currentThought => config?['thought'] as String? ?? '';
+  ModelSelection? get currentSelection =>
+      ModelSelection.fromJson(config?['modelSelection']);
+  String get currentModel =>
+      currentSelection?.modelId ?? config?['model'] as String? ?? '';
+  String get currentThought =>
+      currentSelection?.reasoningLevel ?? config?['thought'] as String? ?? '';
   String get currentMode => config?['mode'] as String? ?? 'build';
   List<String> get thoughtLevels => config?['thoughtLevels'] is List
       ? (config!['thoughtLevels'] as List).map((e) => '$e').toList()

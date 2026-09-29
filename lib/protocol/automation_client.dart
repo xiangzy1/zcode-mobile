@@ -1,4 +1,5 @@
 import 'channel_client.dart';
+import 'model_selection.dart';
 import 'zemote_client.dart';
 
 /// A scheduled/automation task on the desktop (`zcode-agent.listAllAutomations`).
@@ -27,13 +28,16 @@ class AutomationEntry {
         title = '${raw['title'] ?? ''}',
         prompt = '${raw['prompt'] ?? ''}',
         cronExpr = '${raw['cronExpr'] ?? ''}',
-        model = '${raw['model'] ?? ''}',
-        provider = '${raw['provider'] ?? ''}',
+        model = ModelSelection.fromJson(raw['modelSelection'])?.modelId ??
+            '${raw['model'] ?? ''}',
+        provider = ModelSelection.fromJson(raw['modelSelection'])?.providerId ??
+            '${raw['provider'] ?? ''}',
         mode = '${raw['mode'] ?? ''}',
-        thoughtLevel = '${raw['thoughtLevel'] ?? ''}',
+        thoughtLevel =
+            ModelSelection.fromJson(raw['modelSelection'])?.reasoningLevel ??
+                '${raw['thoughtLevel'] ?? ''}',
         recurring = raw['recurring'] == true,
-        scheduleRule =
-            (raw['scheduleRule'] as Map?)?.cast<String, dynamic>(),
+        scheduleRule = (raw['scheduleRule'] as Map?)?.cast<String, dynamic>(),
         enabled = raw['enabled'] == true,
         lifecycleStatus = '${raw['lifecycleStatus'] ?? ''}',
         runCount = (raw['runCount'] as num?)?.toInt() ?? 0,
@@ -79,7 +83,9 @@ class AutomationClient {
   final BridgeSession bridge;
   final Map<String, dynamic> scope;
 
-  const AutomationClient({required this.bridge, required this.scope});
+  AutomationClient({required this.bridge, required this.scope});
+
+  final _entries = <String, AutomationEntry>{};
 
   ChannelClient get _channels => bridge.channels;
 
@@ -89,16 +95,29 @@ class AutomationClient {
           'workspaceIdentity': scope['workspaceIdentity'],
       };
 
-  /// All automations (active + completed) for this workspace.
+  Map<String, dynamic> _scopeFor(String automationId) {
+    final raw = _entries[automationId]?.raw;
+    if (raw?['workspacePath'] is! String) return _scopeMap;
+    return {
+      'workspacePath': raw!['workspacePath'],
+      if (raw['workspaceIdentity'] != null)
+        'workspaceIdentity': raw['workspaceIdentity'],
+    };
+  }
+
+  /// All automations on this host, as in the web settings page.
   Future<List<AutomationEntry>> list() async {
-    final res = await _channels.call(
-        'zcode-agent', 'listAllAutomations', [_scopeMap],
+    final res = await _channels.call('zcode-agent', 'listAllAutomations', [],
         timeout: const Duration(seconds: 30));
     if (res is! List) return const [];
-    return [
+    final entries = [
       for (final item in res.whereType<Map>())
         AutomationEntry(item.cast<String, dynamic>()),
     ];
+    _entries
+      ..clear()
+      ..addEntries(entries.map((e) => MapEntry(e.automationId, e)));
+    return entries;
   }
 
   /// Creates an automation. [scheduleRule] like
@@ -116,50 +135,73 @@ class AutomationClient {
     required Map<String, dynamic> scheduleRule,
     bool enabled = true,
   }) async {
-    final res = await _channels.call('zcode-agent', 'createAutomation', [
-      {
-        ..._scopeMap,
-        'title': title,
-        'prompt': prompt,
-        'cronExpr': cronExpr,
-        'model': model,
-        'provider': provider,
-        'mode': mode,
-        'thoughtLevel': thoughtLevel,
-        'recurring': recurring,
-        'scheduleRule': scheduleRule,
-        'enabled': enabled,
-      },
-    ], timeout: const Duration(seconds: 20));
+    final res = await _channels.call(
+        'zcode-agent',
+        'createAutomation',
+        [
+          {
+            ..._scopeMap,
+            'title': title,
+            'prompt': prompt,
+            'cronExpr': cronExpr,
+            'modelSelection':
+                ModelSelection(provider, model, thoughtLevel).toJson(),
+            'mode': mode,
+            'recurring': recurring,
+            'scheduleRule': scheduleRule,
+            'enabled': enabled,
+          },
+        ],
+        timeout: const Duration(seconds: 20));
     return AutomationEntry(
         res is Map ? res.cast<String, dynamic>() : <String, dynamic>{});
   }
 
   /// Enables or disables an automation.
   Future<dynamic> setEnabled(String automationId, bool enabled) {
-    return _channels.call('zcode-agent', 'setAutomationEnabled', [
-      {..._scopeMap, 'automationId': automationId, 'enabled': enabled},
-    ], timeout: const Duration(seconds: 15));
+    return _channels.call(
+        'zcode-agent',
+        'setAutomationEnabled',
+        [
+          {
+            ..._scopeFor(automationId),
+            'automationId': automationId,
+            'enabled': enabled
+          },
+        ],
+        timeout: const Duration(seconds: 15));
   }
 
   /// Deletes an automation.
   Future<dynamic> delete(String automationId) {
-    return _channels.call('zcode-agent', 'deleteAutomation', [
-      {..._scopeMap, 'automationId': automationId},
-    ], timeout: const Duration(seconds: 15));
+    return _channels.call(
+        'zcode-agent',
+        'deleteAutomation',
+        [
+          {..._scopeFor(automationId), 'automationId': automationId},
+        ],
+        timeout: const Duration(seconds: 15));
   }
 
   /// Runs an automation immediately (queues a run).
   Future<dynamic> runNow(String automationId) {
-    return _channels.call('zcode-agent', 'runAutomationNow', [
-      {..._scopeMap, 'automationId': automationId},
-    ], timeout: const Duration(seconds: 15));
+    return _channels.call(
+        'zcode-agent',
+        'runAutomationNow',
+        [
+          {..._scopeFor(automationId), 'automationId': automationId},
+        ],
+        timeout: const Duration(seconds: 15));
   }
 
   /// Restarts a completed/errored automation.
   Future<dynamic> restart(String automationId) {
-    return _channels.call('zcode-agent', 'restartAutomation', [
-      {..._scopeMap, 'automationId': automationId},
-    ], timeout: const Duration(seconds: 15));
+    return _channels.call(
+        'zcode-agent',
+        'restartAutomation',
+        [
+          {..._scopeFor(automationId), 'automationId': automationId},
+        ],
+        timeout: const Duration(seconds: 15));
   }
 }

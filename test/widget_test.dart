@@ -7,8 +7,8 @@ import 'package:zemote/protocol/proof.dart';
 import 'package:zemote/protocol/conversation.dart';
 
 void main() {
-  test('Conversation V4 uses desktop protocol capability version', () {
-    expect(conversationProtocolAppVersion, '3.6.5');
+  test('Conversation V4 identifies itself like the web client', () {
+    expect(conversationProtocolAppVersion, 'unknown');
   });
 
   test('parse zemote connection url', () {

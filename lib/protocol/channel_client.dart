@@ -154,7 +154,8 @@ class Channels {
   static const zcodeSession = 'zcode-session';
   static const fileWatcher = 'file-watcher';
   static const oauth = 'oauth';
-  static const modelProvider = 'model-provider';
+  static const modelSelection = 'model-selection';
+  static const providerSettings = 'provider-settings';
   static const usageStats = 'usage-stats';
   static const codingPlanSubscription = 'coding-plan-subscription';
   static const skills = 'skills';

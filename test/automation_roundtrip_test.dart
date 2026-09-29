@@ -56,10 +56,17 @@ void main() {
                 'title': 'zemote-probe-automation',
                 'prompt': '这是一条来自 zemote 的协议探测任务，请只回复 ok 两个字',
                 'cronExpr': '*/5 * * * *',
-                'model': 'builtin:zai-coding-plan/GLM-5.2',
-                'provider': 'glm',
+                'modelSelection':
+                    (await bridge.conversation(scope).modelSelection(
+                              selection: (await bridge
+                                      .conversation(scope)
+                                      .prepareWorkspace())
+                                  .modelView
+                                  ?.preferredSelection,
+                            ))
+                        .requireEffectiveSelection()
+                        .toJson(),
                 'mode': 'yolo',
-                'thoughtLevel': 'max',
                 'recurring': true,
                 'scheduleRule': {
                   'unit': 'minute',
@@ -79,7 +86,7 @@ void main() {
 
       // 2) LIST — should contain our automation
       if (automationId != null) {
-        final list = await ch.call('zcode-agent', 'listAllAutomations', [scope],
+        final list = await ch.call('zcode-agent', 'listAllAutomations', [],
             timeout: const Duration(seconds: 12));
         final found = list is List &&
             list.any((a) => a is Map && a['automationId'] == automationId);
@@ -133,7 +140,7 @@ void main() {
             p('$m FAIL', e);
           }
         }
-        final list = await ch.call('zcode-agent', 'listAllAutomations', [scope],
+        final list = await ch.call('zcode-agent', 'listAllAutomations', [],
             timeout: const Duration(seconds: 12));
         final gone = list is List &&
             !list.any((a) => a is Map && a['automationId'] == automationId);

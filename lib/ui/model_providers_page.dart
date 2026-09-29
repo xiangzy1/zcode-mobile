@@ -1,11 +1,10 @@
 import 'package:flutter/material.dart';
 
-import '../protocol/channel_client.dart';
-import '../protocol/id.dart';
+import '../protocol/provider_settings.dart';
 import '../protocol/zemote_client.dart';
 import 'theme.dart';
 
-/// Model provider management (model-provider channel: getAll/save/delete).
+/// Provider settings from the current host registry.
 class ModelProvidersPage extends StatefulWidget {
   final BridgeSession session;
 
@@ -19,21 +18,45 @@ class _ModelProvidersPageState extends State<ModelProvidersPage> {
   List<Map<String, dynamic>> _providers = const [];
   bool _loading = true;
   String? _error;
+  void Function()? _cancelChanges;
+  ProviderSettingsClient get _client =>
+      ProviderSettingsClient(widget.session.channels);
 
   @override
   void initState() {
     super.initState();
+    _listen();
+    widget.session.recovered.addListener(_recovered);
     _load();
   }
 
+  void _listen() {
+    _cancelChanges = widget.session.channels
+        .addEventListener('provider-settings', 'onDidChange', (_) => _load());
+  }
+
+  void _recovered() {
+    _cancelChanges?.call();
+    _listen();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    _cancelChanges?.call();
+    widget.session.recovered.removeListener(_recovered);
+    super.dispose();
+  }
+
   Future<void> _load() async {
+    if (!mounted) return;
     setState(() {
       _loading = true;
       _error = null;
     });
     try {
-      final res = await widget.session.channels
-          .call('model-provider', 'getAll', []);
+      final view = await _client.getView();
+      final res = view['providers'];
       if (mounted) {
         setState(() {
           _providers = res is List
@@ -55,18 +78,9 @@ class _ModelProvidersPageState extends State<ModelProvidersPage> {
     }
   }
 
-  Future<void> _save(Map<String, dynamic> provider) async {
-    await widget.session.channels.call('model-provider', 'save', [
-      {
-        ...provider,
-        'updatedAt': DateTime.now().millisecondsSinceEpoch,
-      },
-    ]);
-  }
-
   Future<void> _toggle(Map<String, dynamic> provider, bool enabled) async {
     try {
-      await _save({...provider, 'enabled': enabled});
+      await _client.setEnabled(provider, enabled);
       await _load();
     } catch (e) {
       _toast('切换失败: $e');
@@ -78,7 +92,7 @@ class _ModelProvidersPageState extends State<ModelProvidersPage> {
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('删除模型供应商？'),
-        content: Text('将删除「${provider['name']}」'),
+        content: Text('将删除「${provider['providerName']}」'),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(context, false),
@@ -93,18 +107,7 @@ class _ModelProvidersPageState extends State<ModelProvidersPage> {
     );
     if (confirmed != true) return;
     try {
-      await widget.session.channels.call('model-provider', 'delete', [
-        {'id': provider['id']},
-      ]);
-    } on ChannelRpcError {
-      // Fallback: try alternate parameter shape
-      try {
-        await widget.session.channels
-            .call('model-provider', 'delete', [provider['id']]);
-      } catch (e2) {
-        _toast('删除失败: $e2');
-        return;
-      }
+      await _client.delete(provider['providerId'] as String);
     } catch (e) {
       _toast('删除失败: $e');
       return;
@@ -127,7 +130,12 @@ class _ModelProvidersPageState extends State<ModelProvidersPage> {
     );
     if (added == null) return;
     try {
-      await _save(added);
+      await _client.create(
+          name: added['name'],
+          baseUrl: added['baseUrl'],
+          apiType: added['apiType'],
+          apiKey: added['apiKey'],
+          models: List<String>.from(added['models']));
       await _load();
       _toast('已添加供应商');
     } catch (e) {
@@ -158,14 +166,13 @@ class _ModelProvidersPageState extends State<ModelProvidersPage> {
                   child: ListView.separated(
                     padding: const EdgeInsets.all(16),
                     itemCount: _providers.length,
-                    separatorBuilder: (_, __) =>
-                        const SizedBox(height: 8),
+                    separatorBuilder: (_, __) => const SizedBox(height: 8),
                     itemBuilder: (context, index) {
                       final p = _providers[index];
                       final enabled = p['enabled'] == true;
-                      final endpoints = p['endpoints'];
+                      final endpoints = p['effectiveConfig']?['api'];
                       final baseUrl = endpoints is Map
-                          ? '${endpoints['baseURL'] ?? ''}'
+                          ? '${endpoints['baseUrl'] ?? ''}'
                           : '';
                       final models =
                           p['models'] is List ? p['models'] as List : [];
@@ -179,11 +186,10 @@ class _ModelProvidersPageState extends State<ModelProvidersPage> {
                             children: [
                               Expanded(
                                 child: Column(
-                                  crossAxisAlignment:
-                                      CrossAxisAlignment.start,
+                                  crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
                                     Text(
-                                      '${p['name'] ?? p['id']}',
+                                      '${p['providerName'] ?? p['providerId']}',
                                       style: const TextStyle(
                                           fontSize: 14,
                                           fontWeight: FontWeight.w600),
@@ -191,16 +197,13 @@ class _ModelProvidersPageState extends State<ModelProvidersPage> {
                                     const SizedBox(height: 3),
                                     Text(
                                       [
-                                        '${p['apiFormat'] ?? ''}',
+                                        '${p['effectiveConfig']?['api']?['type'] ?? ''}',
                                         if (models.isNotEmpty)
                                           '${models.length} 个模型',
                                         baseUrl,
-                                        if (!enabled &&
-                                            disabledReason != null)
+                                        if (!enabled && disabledReason != null)
                                           '停用: $disabledReason',
-                                      ]
-                                          .where((s) => s.isNotEmpty)
-                                          .join(' · '),
+                                      ].where((s) => s.isNotEmpty).join(' · '),
                                       style: TextStyle(
                                           fontSize: 11,
                                           color: ZInk.faint(context)),
@@ -212,14 +215,19 @@ class _ModelProvidersPageState extends State<ModelProvidersPage> {
                               ),
                               Switch(
                                 value: enabled,
-                                onChanged: (v) => _toggle(p, v),
+                                onChanged: p['effectiveConfig']?['access']
+                                            ?['type'] ==
+                                        'zhipu-account'
+                                    ? null
+                                    : (v) => _toggle(p, v),
                               ),
                               IconButton(
-                                icon: Icon(
-                                    Icons.delete_outline,
-                                    size: 18,
-                                    color: ZInk.faint(context)),
-                                onPressed: () => _delete(p),
+                                icon: Icon(Icons.delete_outline,
+                                    size: 18, color: ZInk.faint(context)),
+                                onPressed: p['effectiveConfig']?['group'] ==
+                                        'standard-personal'
+                                    ? () => _delete(p)
+                                    : null,
                               ),
                             ],
                           ),
@@ -248,8 +256,8 @@ class _AddProviderSheetState extends State<_AddProviderSheet> {
 
   static const _formats = [
     'anthropic-messages',
-    'openai-chat',
-    'gemini',
+    'openai-chat-completions',
+    'openai-responses',
   ];
 
   @override
@@ -265,45 +273,17 @@ class _AddProviderSheetState extends State<_AddProviderSheet> {
     final name = _nameController.text.trim();
     final baseUrl = _baseUrlController.text.trim();
     if (name.isEmpty || baseUrl.isEmpty) return;
-    final now = DateTime.now().millisecondsSinceEpoch;
     final modelIds = _modelsController.text
         .split(RegExp(r'[,\n]'))
         .map((e) => e.trim())
         .where((e) => e.isNotEmpty)
         .toList();
-    final kind = _apiFormat.startsWith('anthropic')
-        ? 'anthropic'
-        : _apiFormat.startsWith('openai')
-            ? 'openai'
-            : 'gemini';
     Navigator.pop(context, {
-      'id': 'custom:${generateUuid()}',
       'name': name,
-      'enabled': true,
-      'endpoints': {
-        'baseURL': baseUrl,
-        'paths': {kind: '/v1/messages'},
-      },
-      'apiFormat': _apiFormat,
-      'source': 'custom',
-      if (_apiKeyController.text.trim().isNotEmpty)
-        'apiKey': _apiKeyController.text.trim(),
-      'defaultKind': kind,
-      'models': [
-        for (var i = 0; i < modelIds.length; i++)
-          {
-            'id': modelIds[i],
-            'kinds': [kind],
-            'defaultKind': kind,
-            'modalities': {
-              'input': ['text'],
-              'output': ['text'],
-            },
-            'priority': 100 + i,
-          },
-      ],
-      'createdAt': now,
-      'updatedAt': now,
+      'baseUrl': baseUrl,
+      'apiType': _apiFormat,
+      'apiKey': _apiKeyController.text.trim(),
+      'models': modelIds,
     });
   }
 
@@ -317,8 +297,7 @@ class _AddProviderSheetState extends State<_AddProviderSheet> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const Text('添加模型供应商',
-              style:
-                  TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
           const SizedBox(height: 16),
           TextField(
             controller: _nameController,
@@ -333,8 +312,7 @@ class _AddProviderSheetState extends State<_AddProviderSheet> {
               for (final f in _formats)
                 DropdownMenuItem(value: f, child: Text(f)),
             ],
-            onChanged: (v) =>
-                setState(() => _apiFormat = v ?? _apiFormat),
+            onChanged: (v) => setState(() => _apiFormat = v ?? _apiFormat),
           ),
           const SizedBox(height: 10),
           TextField(
@@ -347,16 +325,14 @@ class _AddProviderSheetState extends State<_AddProviderSheet> {
           TextField(
             controller: _apiKeyController,
             obscureText: true,
-            decoration: const InputDecoration(
-                labelText: 'API Key（可选）'),
+            decoration: const InputDecoration(labelText: 'API Key（可选）'),
           ),
           const SizedBox(height: 10),
           TextField(
             controller: _modelsController,
             maxLines: 2,
             decoration: const InputDecoration(
-                labelText: '模型 ID（逗号分隔）',
-                hintText: 'GLM-5.2, GLM-5-Turbo'),
+                labelText: '模型 ID（逗号分隔）', hintText: 'GLM-5.2, GLM-5-Turbo'),
           ),
           const SizedBox(height: 16),
           SizedBox(

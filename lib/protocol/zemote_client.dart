@@ -19,15 +19,12 @@ class ZemoteClient {
   final void Function(String line)? onLog;
 
   late final RelayClient relay;
-  final _pendingMatchers =
-      <String, bool Function(Map<String, dynamic>)>{};
-  final _pendingCompleters =
-      <String, Completer<Map<String, dynamic>>>{};
+  final _pendingMatchers = <String, bool Function(Map<String, dynamic>)>{};
+  final _pendingCompleters = <String, Completer<Map<String, dynamic>>>{};
 
   StreamSubscription? _payloadSub;
 
-  final _workspaceListUpdatedController =
-      StreamController<dynamic>.broadcast();
+  final _workspaceListUpdatedController = StreamController<dynamic>.broadcast();
   Stream<dynamic> get workspaceListUpdated =>
       _workspaceListUpdatedController.stream;
 
@@ -182,9 +179,7 @@ class ZemoteClient {
     final done = <String>[];
     _pendingMatchers.forEach((requestId, matcher) {
       final completer = _pendingCompleters[requestId];
-      if (completer != null &&
-          !completer.isCompleted &&
-          matcher(payload)) {
+      if (completer != null && !completer.isCompleted && matcher(payload)) {
         done.add(requestId);
         completer.complete(payload);
       }
@@ -218,8 +213,7 @@ class ZemoteClient {
     final id = _reqId('bootstrap');
     final res = await request(
       {'zcode_type': 'bootstrap-request', 'requestId': id},
-      (p) =>
-          p['zcode_type'] == 'bootstrap-response' && p['requestId'] == id,
+      (p) => p['zcode_type'] == 'bootstrap-response' && p['requestId'] == id,
     );
     return (res['result'] as Map?)?.cast<String, dynamic>() ?? res;
   }
@@ -230,18 +224,15 @@ class ZemoteClient {
     final res = await request(
       {'zcode_type': 'workspace-list-request', 'requestId': id},
       (p) =>
-          p['zcode_type'] == 'workspace-list-response' &&
-          p['requestId'] == id,
+          p['zcode_type'] == 'workspace-list-response' && p['requestId'] == id,
     );
     return res['result'];
   }
 
   int _bridgeGeneration = 0;
   final _activeBridges = <BridgeSession>[];
-  final _frameRouters =
-      <String, void Function(Map<String, dynamic>)>{};
-  final _pendingBridgePayloads =
-      <String, List<Map<String, dynamic>>>{};
+  final _frameRouters = <String, void Function(Map<String, dynamic>)>{};
+  final _pendingBridgePayloads = <String, List<Map<String, dynamic>>>{};
 
   /// bridge-degraded (e.g. `rpc-transport-fault`): the desktop stopped the
   /// bridge transport. Mark it degraded and kick off the retrying recovery
@@ -351,8 +342,7 @@ class ZemoteClient {
   /// Reopens a degraded/dead bridge: new `workspace-bridge-open` (fresh
   /// bridgeSessionId, bumped generation, carries recoveryId), then swaps
   /// the stack into the existing [BridgeSession].
-  Future<void> _reopenBridge(
-      BridgeSession session, String workspaceKey) async {
+  Future<void> _reopenBridge(BridgeSession session, String workspaceKey) async {
     final oldBridge = session.bridge;
     final bridgeSessionId = _reqId('bridge');
     final generation = ++_bridgeGeneration;
@@ -473,8 +463,7 @@ class BridgeSession {
         _channels = ChannelClient(sendBody: (_) {}),
         _onDispose = onDispose;
 
-  static RpcFrameTransport _placeholderTransport(
-          Map<String, dynamic> bridge) =>
+  static RpcFrameTransport _placeholderTransport(Map<String, dynamic> bridge) =>
       RpcFrameTransport(
         bridgeSessionId: '${bridge['bridgeSessionId'] ?? ''}',
         sendPayload: (_) {},
@@ -520,6 +509,9 @@ class BridgeSession {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    for (final conversation in _conversations.values) {
+      conversation.dispose();
+    }
     degraded.dispose();
     recovered.dispose();
     _transport.dispose();

@@ -383,6 +383,7 @@ class _CreateAutomationSheetState extends State<_CreateAutomationSheet> {
   bool _creating = false;
   String? _error;
   WorkspacePrep? _prep;
+  ModelSelection? _selection;
 
   @override
   void initState() {
@@ -394,8 +395,14 @@ class _CreateAutomationSheetState extends State<_CreateAutomationSheet> {
     try {
       final prep =
           await widget.session.conversation(widget.scope).prepareWorkspace();
-      if (mounted) setState(() => _prep = prep);
-    } catch (_) {}
+      if (mounted)
+        setState(() {
+          _prep = prep;
+          _selection ??= prep.modelView?.preferredSelection;
+        });
+    } catch (e) {
+      if (mounted) setState(() => _error = '模型加载失败: $e');
+    }
   }
 
   @override
@@ -452,20 +459,19 @@ class _CreateAutomationSheetState extends State<_CreateAutomationSheet> {
     try {
       final client =
           AutomationClient(bridge: widget.session, scope: widget.scope);
-      final prep = _prep;
-      final modelOpt = prep?.option('model');
-      final thoughtOpt = prep?.option('thought_level');
-      final modelValue =
-          '${modelOpt?.currentValue ?? 'builtin:zai-coding-plan/GLM-5.2'}';
-      final idx = modelValue.lastIndexOf('/');
+      final transport = widget.session.conversation(widget.scope);
+      final prep = _prep ?? await transport.prepareWorkspace(refresh: true);
+      final selected = _selection ?? prep.modelView?.preferredSelection;
+      final view = await transport.modelSelection(selection: selected);
+      final model = view.requireEffectiveSelection();
       final client_ = await client.create(
         title: title,
         prompt: prompt,
         cronExpr: _cronExpr(),
-        model: idx > 0 ? modelValue.substring(idx + 1) : modelValue,
-        provider: idx > 0 ? modelValue.substring(0, idx) : 'glm',
+        model: model.modelId,
+        provider: model.providerId,
         mode: 'build',
-        thoughtLevel: '${thoughtOpt?.currentValue ?? 'max'}',
+        thoughtLevel: model.reasoningLevel!,
         recurring: true,
         scheduleRule: _scheduleRule(),
         enabled: true,
@@ -524,6 +530,37 @@ class _CreateAutomationSheetState extends State<_CreateAutomationSheet> {
                 border: OutlineInputBorder(),
               ),
             ),
+            const SizedBox(height: 12),
+            DropdownButtonFormField<String>(
+              key: ValueKey(_selection?.value),
+              initialValue: _prep?.modelView?.model(_selection?.value) != null
+                  ? _selection?.value
+                  : null,
+              isExpanded: true,
+              decoration: const InputDecoration(labelText: '模型'),
+              items: [
+                for (final model
+                    in _prep?.modelView?.models ?? <SelectableModel>[])
+                  DropdownMenuItem(
+                      value: model.value,
+                      child: Text('${model.providerName} / ${model.modelId}',
+                          overflow: TextOverflow.ellipsis)),
+              ],
+              onChanged: (value) => setState(() => _selection =
+                  _prep?.modelView?.model(value)?.defaultSelection),
+            ),
+            Wrap(spacing: 8, children: [
+              for (final level in _prep?.modelView
+                      ?.model(_selection?.value)
+                      ?.reasoningLevels ??
+                  <String>[])
+                ChoiceChip(
+                    label: Text(level),
+                    selected: _selection?.reasoningLevel == level,
+                    onSelected: (_) => setState(() => _selection =
+                        ModelSelection(_selection!.providerId,
+                            _selection!.modelId, level))),
+            ]),
             const SizedBox(height: 12),
             const Text('执行频率', style: TextStyle(fontSize: 13)),
             const SizedBox(height: 8),

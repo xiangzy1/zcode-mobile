@@ -12,11 +12,10 @@ import 'package:zemote/protocol/zemote_client.dart';
 /// `flutter test integration_test`). Without it the suite is skipped.
 void main() {
   test('full feature suite', () async {
-    final probeUrl = String.fromEnvironment('ZEMOTE_PROBE_URL',
-        defaultValue: '');
-    final params = probeUrl.isEmpty
-        ? null
-        : ZemoteConnectionParams.parse(probeUrl);
+    final probeUrl =
+        String.fromEnvironment('ZEMOTE_PROBE_URL', defaultValue: '');
+    final params =
+        probeUrl.isEmpty ? null : ZemoteConnectionParams.parse(probeUrl);
     if (params == null) {
       // ignore: avoid_print
       print('SKIP: ZEMOTE_PROBE_URL not set or invalid — integration '
@@ -85,16 +84,15 @@ void main() {
       [scope],
       timeout: const Duration(seconds: 30),
     );
-    check('IPC init + listTasks', tasks is List, 'count=${tasks is List ? tasks.length : '?'}');
+    check('IPC init + listTasks', tasks is List,
+        'count=${tasks is List ? tasks.length : '?'}');
 
     // 6. pinned/archived lists
-    final pinned = await bridge.channels
-        .call('zcode-task', 'listPinnedTasks', [scope])
-        .catchError((Object e) => 'ERR:$e');
+    final pinned = await bridge.channels.call('zcode-task', 'listPinnedTasks',
+        [scope]).catchError((Object e) => 'ERR:$e');
     check('listPinnedTasks', pinned is List);
-    final archived = await bridge.channels
-        .call('zcode-task', 'listArchivedTasks', [scope])
-        .catchError((Object e) => 'ERR:$e');
+    final archived = await bridge.channels.call('zcode-task',
+        'listArchivedTasks', [scope]).catchError((Object e) => 'ERR:$e');
     check('listArchivedTasks', archived is List);
 
     // 7. prepareWorkspace
@@ -103,20 +101,16 @@ void main() {
         'slashCommands=${prep.slashCommands.length}');
 
     // 8. createSession with config
-    final modelOpt = prep.option('model');
+    final initialModel = prep.modelView!.models.first.defaultSelection;
+    final initialView = await transport.modelSelection(selection: initialModel);
+    final submissionConfig = {
+      'modelSelection': initialView.requireEffectiveSelection().toJson(),
+      'mode': 'build',
+      'planEnabled': false,
+    };
     final sessionId = await transport.createSession(
       w['workspaceIdentity'] as String? ?? w['workspacePath'] as String,
-      config: modelOpt != null && modelOpt.options.isNotEmpty
-          ? {
-              'provider':
-                  modelOpt.options.first.value.split('/').first.contains(':')
-                      ? modelOpt.options.first.value
-                          .substring(0, modelOpt.options.first.value.lastIndexOf('/'))
-                      : null,
-              'model': modelOpt.options.first.value
-                  .substring(modelOpt.options.first.value.lastIndexOf('/') + 1),
-            }
-          : null,
+      config: submissionConfig,
     );
     check('createSession(config)', sessionId.isNotEmpty, sessionId);
 
@@ -129,69 +123,28 @@ void main() {
     check('订阅会话快照', sub.state.ready, 'rows=${sub.state.rows.length}');
 
     // 10. sendText + streaming
-    final sendRes = await transport.sendText(sessionId, '只回复ok两个字');
+    final sendRes = await transport.sendText(sessionId, '只回复ok两个字',
+        submissionConfig: submissionConfig);
     check('sendText accepted', ackOk(sendRes), '$sendRes');
     final streamDeadline = DateTime.now().add(const Duration(seconds: 90));
     while (DateTime.now().isBefore(streamDeadline)) {
-      final assistant = sub.state.rows
-          .where((r) => r['kind'] == 'assistantText')
-          .toList();
-      if (assistant.isNotEmpty &&
-          assistant.last['state'] == 'complete') {
+      final assistant =
+          sub.state.rows.where((r) => r['kind'] == 'assistantText').toList();
+      if (assistant.isNotEmpty && assistant.last['state'] == 'complete') {
         break;
       }
       await Future.delayed(const Duration(milliseconds: 500));
     }
     final assistantRows =
         sub.state.rows.where((r) => r['kind'] == 'assistantText').toList();
-    check('流式回复完成', assistantRows.isNotEmpty,
-        'rows=${sub.state.rows.length}');
+    check('流式回复完成', assistantRows.isNotEmpty, 'rows=${sub.state.rows.length}');
 
-    // 11. switchModelConfig (CAS) — thought level must be valid for the
-    // target model; look it up from model-provider's reasoning metadata
-    if (modelOpt != null && modelOpt.options.isNotEmpty) {
-      final v = modelOpt.options.last.value;
-      final idx = v.lastIndexOf('/');
-      final providerId = v.substring(0, idx);
-      final modelId = v.substring(idx + 1);
-      var thought = sub.state.currentThought.isNotEmpty
-          ? sub.state.currentThought
-          : 'enabled';
-      try {
-        final providers =
-            await bridge.channels.call('model-provider', 'getAll', []);
-        if (providers is List) {
-          for (final p in providers.whereType<Map>()) {
-            if (p['id'] != providerId) continue;
-            for (final m in (p['models'] as List? ?? []).whereType<Map>()) {
-              if (m['id'] == modelId && m['reasoning'] is Map) {
-                final reasoning = m['reasoning'] as Map;
-                final levels = reasoning['levels'];
-                final valid = levels is Map
-                    ? levels.keys.map((e) => '$e').toList()
-                    : <String>[];
-                if (valid.isNotEmpty && !valid.contains(thought)) {
-                  thought = '${reasoning['defaultLevel'] ?? valid.first}';
-                }
-              }
-            }
-          }
-        }
-      } catch (_) {}
-      final res = await transport.switchModelConfig(
-        sessionId,
-        provider: providerId,
-        model: modelId,
-        thought: thought,
-      );
-      check('switchModelConfig (CAS)', ackOk(res), '$res');
-    }
-
-    // 12. switchCollaborationMode (CAS)
-    final modeRes =
-        await transport.switchCollaborationMode(sessionId, 'plan');
-    check('switchCollaborationMode (CAS)', ackOk(modeRes), '$modeRes');
-    await transport.switchCollaborationMode(sessionId, 'build');
+    // Model/mode changes are composer intent, validated with getView and
+    // submitted with the next message; they no longer mutate the live session.
+    final nextModel = prep.modelView!.models.last.defaultSelection;
+    final nextView = await transport.modelSelection(selection: nextModel);
+    check('model-selection getView',
+        nextView.requireEffectiveSelection().modelId == nextModel.modelId);
 
     // 13. setFollowupMode (CAS)
     final fmRes = await transport.setFollowupMode(sessionId, 'guide');
@@ -199,16 +152,14 @@ void main() {
     await transport.setFollowupMode(sessionId, 'queue');
 
     // 14. setAssistantFeedback (CAS + baseLogEpoch)
-    final targetRow = sub.state.rows
-        .where((r) => r['kind'] == 'assistantText')
-        .lastOrNull;
+    final targetRow =
+        sub.state.rows.where((r) => r['kind'] == 'assistantText').lastOrNull;
     if (targetRow != null) {
       final fbRes = await transport.setAssistantFeedback(
         sessionId,
         {
           'rowId': targetRow['rowId'],
-          if (targetRow['entityId'] != null)
-            'entityId': targetRow['entityId'],
+          if (targetRow['entityId'] != null) 'entityId': targetRow['entityId'],
         },
         'like',
       );
@@ -234,8 +185,8 @@ void main() {
       final editRes = await transport.editQueueItem(
           sessionId, '${item['queueItemId']}', '排队消息测试(已编辑)');
       check('editQueueItem (CAS)', ackOk(editRes), '$editRes');
-      final nowRes = await transport.sendQueuedNow(
-          sessionId, '${item['queueItemId']}');
+      final nowRes =
+          await transport.sendQueuedNow(sessionId, '${item['queueItemId']}');
       check('sendQueuedNow (CAS)', ackOk(nowRes), '$nowRes');
     } else {
       info('未产生排队项（autoDrain 或时机原因），跳过队列操作断言');
@@ -251,8 +202,7 @@ void main() {
     }
 
     // 17. goal commands (CAS)
-    final goalRes =
-        await transport.sendGoalCommand(sessionId, '测试目标：回复简短');
+    final goalRes = await transport.sendGoalCommand(sessionId, '测试目标：回复简短');
     info('sendGoalCommand: $goalRes');
     final pauseRes = await transport.pauseGoal(sessionId);
     check('pauseGoal (CAS)', ackOk(pauseRes), '$pauseRes');
@@ -260,9 +210,8 @@ void main() {
     check('resumeGoal (CAS)', ackOk(resumeRes), '$resumeRes');
 
     // 18. compact（可能因运行中/空闲被拒，记录）
-    final compactRes = await transport
-        .compact(sessionId)
-        .catchError((Object e) => 'ERR:$e');
+    final compactRes =
+        await transport.compact(sessionId).catchError((Object e) => 'ERR:$e');
     info('compact: $compactRes');
 
     // 19. attachment upload + send
@@ -303,8 +252,8 @@ void main() {
           .subscribe(sideId)
           .timeout(const Duration(seconds: 25));
       await Future.delayed(const Duration(milliseconds: 800));
-      check('侧对话订阅快照', sideSub.state.ready,
-          'rows=${sideSub.state.rows.length}');
+      check(
+          '侧对话订阅快照', sideSub.state.ready, 'rows=${sideSub.state.rows.length}');
       await sideSub.dispose();
     } catch (e) {
       info('createSelectionSideSession 探测: $e');
@@ -332,9 +281,9 @@ void main() {
 
     // 24. model providers
     final providers =
-        await bridge.channels.call('model-provider', 'getAll', []);
-    check('model-provider.getAll', providers is List,
-        'count=${providers is List ? providers.length : '?'}');
+        await bridge.channels.call('provider-settings', 'getView', []);
+    check('provider-settings.getView',
+        providers is Map && providers['providers'] is List);
 
     // 25. renameTask
     final renameRes = await bridge.channels.call(
@@ -425,7 +374,8 @@ void main() {
 
     await client.dispose();
     // ignore: avoid_print
-    print('SUITE DONE: ${results.where((r) => r.startsWith('[PASS]')).length} passed, '
+    print(
+        'SUITE DONE: ${results.where((r) => r.startsWith('[PASS]')).length} passed, '
         '${results.where((r) => r.startsWith('[FAIL]')).length} failed, '
         '${results.where((r) => r.startsWith('[INFO]')).length} info');
   }, timeout: const Timeout(Duration(minutes: 8)));

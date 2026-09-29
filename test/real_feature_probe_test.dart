@@ -55,7 +55,7 @@ void main() {
     await probe(
         'plugins', () => channels.call('zcode-agent', 'listPlugins', [scope]));
     await probe('automations',
-        () => channels.call('zcode-agent', 'listAllAutomations', [scope]));
+        () => channels.call('zcode-agent', 'listAllAutomations', []));
     await probe('skills', () => channels.call('skills', 'list', [scope]));
     await probe('commands', () => channels.call('commands', 'list', [scope]));
     await probe(
