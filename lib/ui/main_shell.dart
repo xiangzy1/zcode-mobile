@@ -42,18 +42,90 @@ String workspaceTitle(Map<String, dynamic> w) {
   return workspaceKeyOf(w) ?? '未知工作区';
 }
 
-/// Latest task `updatedAt` seen per workspace key (see [workspaceKeyOf]),
-/// ingested from the bootstrap / workspace-list global task lists.
-typedef TaskTimeByKey = Map<String, int>;
+/// Aggregated task activity per workspace, derived from the global task
+/// lists (bootstrap / workspace-list-updated). Drives picker ordering and
+/// the running/unread markers.
+class WorkspaceActivity {
+  int lastTaskAt = 0;
+  int runningCount = 0;
+  int unreadCount = 0;
+}
 
-int latestTaskTimeOf(Map<String, dynamic> w, TaskTimeByKey taskTimeByKey) {
+/// Task workspace key: trimmed `workspaceIdentity` or `workspacePath` — the
+/// same rule as [workspaceKeyOf]'s primary branches.
+String? workspaceKeyOfTask(Map<dynamic, dynamic> t) {
+  final identity = t['workspaceIdentity'];
+  if (identity is String && identity.trim().isNotEmpty) return identity.trim();
+  final path = t['workspacePath'];
+  if (path is String && path.isNotEmpty) return path;
+  return null;
+}
+
+Map<String, WorkspaceActivity> summarizeWorkspaceActivity(
+    Iterable<dynamic> tasks) {
+  final out = <String, WorkspaceActivity>{};
+  for (final t in tasks) {
+    if (t is! Map) continue;
+    final key = workspaceKeyOfTask(t);
+    if (key == null) continue;
+    final activity = out.putIfAbsent(key, WorkspaceActivity.new);
+    final updatedAt = t['updatedAt'];
+    if (updatedAt is num && updatedAt > activity.lastTaskAt) {
+      activity.lastTaskAt = updatedAt.toInt();
+    }
+    final status = '${t['displayStatus'] ?? t['status'] ?? ''}';
+    if (status == 'running' || status == 'prewarming') activity.runningCount++;
+    if (t['unreadAt'] != null) activity.unreadCount++;
+  }
+  return out;
+}
+
+int latestTaskTimeOf(
+    Map<String, dynamic> w, Map<String, WorkspaceActivity> activityByKey) {
   final identity = w['workspaceIdentity'];
   if (identity is String && identity.trim().isNotEmpty) {
-    return taskTimeByKey[identity.trim()] ?? 0;
+    return activityByKey[identity.trim()]?.lastTaskAt ?? 0;
   }
   final path = w['workspacePath'];
-  if (path is String && path.isNotEmpty) return taskTimeByKey[path] ?? 0;
-  return taskTimeByKey[workspaceKeyOf(w)] ?? 0;
+  if (path is String && path.isNotEmpty) {
+    return activityByKey[path]?.lastTaskAt ?? 0;
+  }
+  return activityByKey[workspaceKeyOf(w)]?.lastTaskAt ?? 0;
+}
+
+/// Merges a (possibly partial) global task push into [current], keyed by
+/// taskId; archived/deleted tasks drop out.
+Map<String, Map<String, dynamic>> mergeGlobalTasks(
+  Map<String, Map<String, dynamic>> current,
+  List<dynamic> tasks,
+) {
+  final next = Map<String, Map<String, dynamic>>.of(current);
+  for (final t in tasks) {
+    if (t is! Map) continue;
+    final id = '${t['taskId'] ?? ''}';
+    if (id.isEmpty) continue;
+    if (t['archived'] == true || t['deleted'] == true) {
+      next.remove(id);
+      continue;
+    }
+    next[id] = {...?next[id], ...t.cast<String, dynamic>()};
+  }
+  return next;
+}
+
+/// Authoritative full snapshot (bootstrap / workspace-list response):
+/// replaces the store wholesale. Cleared fields (e.g. `unreadAt` dropped
+/// after mark-read) must not linger from earlier partial merges.
+Map<String, Map<String, dynamic>> replaceGlobalTasks(List<dynamic> tasks) {
+  final next = <String, Map<String, dynamic>>{};
+  for (final t in tasks) {
+    if (t is! Map) continue;
+    final id = '${t['taskId'] ?? ''}';
+    if (id.isEmpty) continue;
+    if (t['archived'] == true || t['deleted'] == true) continue;
+    next[id] = t.cast<String, dynamic>();
+  }
+  return next;
 }
 
 /// Picker order: workspaces with newer task activity first. Ties (and
@@ -61,7 +133,7 @@ int latestTaskTimeOf(Map<String, dynamic> w, TaskTimeByKey taskTimeByKey) {
 /// via the stable index sort.
 List<Map<String, dynamic>> sortWorkspacesByTaskTime(
   List<dynamic> workspaces,
-  TaskTimeByKey taskTimeByKey,
+  Map<String, WorkspaceActivity> activityByKey,
 ) {
   final maps = [
     for (final w in workspaces)
@@ -69,9 +141,8 @@ List<Map<String, dynamic>> sortWorkspacesByTaskTime(
   ];
   final order = List<int>.generate(maps.length, (i) => i);
   order.sort((a, b) {
-    final byTime =
-        latestTaskTimeOf(maps[b], taskTimeByKey)
-            .compareTo(latestTaskTimeOf(maps[a], taskTimeByKey));
+    final byTime = latestTaskTimeOf(maps[b], activityByKey)
+        .compareTo(latestTaskTimeOf(maps[a], activityByKey));
     return byTime != 0 ? byTime : a.compareTo(b);
   });
   return [for (final i in order) maps[i]];
@@ -178,7 +249,10 @@ class _MainShellContent extends StatefulWidget {
 class _MainShellContentState extends State<_MainShellContent> {
   int _tab = 0;
   List<dynamic> _workspaces = const [];
-  final TaskTimeByKey _taskTimeByKey = {};
+
+  /// Global task summaries (keyed by taskId): merged from pushes, replaced
+  /// wholesale by full snapshots (bootstrap / workspace-list refresh).
+  Map<String, Map<String, dynamic>> _globalTasks = {};
   bool _loading = true;
   String? _error;
   Map<String, dynamic>? _activeWorkspace;
@@ -200,7 +274,7 @@ class _MainShellContentState extends State<_MainShellContent> {
       final tasks = result['tasks'];
       setState(() {
         if (list is List) _workspaces = list;
-        if (tasks is List) _ingestTaskTimes(tasks);
+        if (tasks is List) _globalTasks = mergeGlobalTasks(_globalTasks, tasks);
       });
     });
     _load();
@@ -227,7 +301,7 @@ class _MainShellContentState extends State<_MainShellContent> {
       final tasks = bootstrap['tasks'];
       setState(() {
         _workspaces = list is List ? list : const [];
-        if (tasks is List) _ingestTaskTimes(tasks);
+        if (tasks is List) _globalTasks = replaceGlobalTasks(tasks);
         _loading = false;
       });
       // Auto-open single workspace (web mobile flow).
@@ -246,22 +320,22 @@ class _MainShellContentState extends State<_MainShellContent> {
     }
   }
 
-  /// Collects the newest task `updatedAt` per workspace from the global task
-  /// lists carried by bootstrap / workspace-list messages. Workspace entries
-  /// themselves carry no task timestamps (mirrors `HC()` keying on the web).
-  void _ingestTaskTimes(List<dynamic> tasks) {
-    for (final t in tasks) {
-      if (t is! Map) continue;
-      final updatedAt = t['updatedAt'];
-      if (updatedAt is! num || updatedAt <= 0) continue;
-      final identity = t['workspaceIdentity'];
-      final path = t['workspacePath'];
-      final key = identity is String && identity.trim().isNotEmpty
-          ? identity.trim()
-          : (path is String && path.isNotEmpty ? path : null);
-      if (key == null) continue;
-      final ms = updatedAt.toInt();
-      if (ms > (_taskTimeByKey[key] ?? 0)) _taskTimeByKey[key] = ms;
+  /// Refreshes the authoritative global task snapshot. Runs when the picker
+  /// becomes visible again: read/unread changes made inside a workspace
+  /// (mark-read etc.) may not arrive as a workspace-list push, so returning
+  /// to the list must re-fetch instead of trusting merged push state.
+  Future<void> _refreshGlobalTasks() async {
+    try {
+      final result = await widget.client.listWorkspaces();
+      if (!mounted || result is! Map) return;
+      final list = result['workspaces'];
+      final tasks = result['tasks'];
+      setState(() {
+        if (list is List) _workspaces = list;
+        if (tasks is List) _globalTasks = replaceGlobalTasks(tasks);
+      });
+    } catch (_) {
+      // Best effort: stale badges persist until the next refresh.
     }
   }
 
@@ -333,6 +407,9 @@ class _MainShellContentState extends State<_MainShellContent> {
       _bridge = null;
       _activeWorkspace = null;
     });
+    // The picker is visible again — re-fetch task state so running/unread
+    // markers reflect what happened inside the workspace.
+    _refreshGlobalTasks();
   }
 
   void _showDeviceSwitcher() {
@@ -454,13 +531,14 @@ class _MainShellContentState extends State<_MainShellContent> {
   }
 
   Widget _content(BridgeSession? bridge) {
+    final activity = summarizeWorkspaceActivity(_globalTasks.values);
     return NotificationListener<ScrollNotification>(
       onNotification: _onScroll,
       child: switch (_tab) {
         0 => bridge == null
             ? _WorkspacePicker(
                 workspaces: _workspaces,
-                taskTimeByKey: _taskTimeByKey,
+                activityByKey: activity,
                 loading: _loading || _bridgeOpening,
                 error: _error,
                 client: widget.client,
@@ -710,7 +788,7 @@ class _DeviceSwitchSheet extends StatelessWidget {
 
 class _WorkspacePicker extends StatelessWidget {
   final List<dynamic> workspaces;
-  final TaskTimeByKey taskTimeByKey;
+  final Map<String, WorkspaceActivity> activityByKey;
   final bool loading;
   final String? error;
   final ZemoteClient client;
@@ -719,7 +797,7 @@ class _WorkspacePicker extends StatelessWidget {
 
   const _WorkspacePicker({
     required this.workspaces,
-    required this.taskTimeByKey,
+    required this.activityByKey,
     required this.loading,
     required this.error,
     required this.client,
@@ -731,7 +809,7 @@ class _WorkspacePicker extends StatelessWidget {
   Widget build(BuildContext context) {
     // Non-map entries are dropped by the sort helper, so the list length
     // and the item count stay consistent.
-    final ordered = sortWorkspacesByTaskTime(workspaces, taskTimeByKey);
+    final ordered = sortWorkspacesByTaskTime(workspaces, activityByKey);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -766,6 +844,8 @@ class _WorkspacePicker extends StatelessWidget {
                           itemBuilder: (context, index) {
                             final workspace = ordered[index];
                             final key = workspaceKeyOf(workspace);
+                            final activity =
+                                key == null ? null : activityByKey[key];
                             final kind = '${workspace['kind'] ?? ''}';
                             return Card(
                               child: InkWell(
@@ -816,6 +896,24 @@ class _WorkspacePicker extends StatelessWidget {
                                           ],
                                         ),
                                       ),
+                                      if (activity != null) ...[
+                                        if (activity.runningCount > 0) ...[
+                                          const SizedBox(width: 8),
+                                          _WorkspaceMarker(
+                                            icon: Icons.sync,
+                                            label:
+                                                '${activity.runningCount} 运行中',
+                                            color: ZColors.running,
+                                          ),
+                                        ],
+                                        if (activity.unreadCount > 0) ...[
+                                          const SizedBox(width: 8),
+                                          _WorkspaceMarker(
+                                            label: '${activity.unreadCount} 未读',
+                                            color: ZColors.warning,
+                                          ),
+                                        ],
+                                      ],
                                       Icon(Icons.chevron_right,
                                           color: ZInk.ghost(context)),
                                     ],
@@ -827,6 +925,41 @@ class _WorkspacePicker extends StatelessWidget {
                         ),
         ),
       ],
+    );
+  }
+}
+
+/// Running/unread pill on a workspace card (same visual language as the
+/// task-list status pill).
+class _WorkspaceMarker extends StatelessWidget {
+  final IconData? icon;
+  final String label;
+  final Color color;
+
+  const _WorkspaceMarker({this.icon, required this.label, required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (icon != null) ...[
+            Icon(icon, size: 10, color: color),
+            const SizedBox(width: 3),
+          ],
+          Text(
+            label,
+            style: TextStyle(
+                fontSize: 10, color: color, fontWeight: FontWeight.w600),
+          ),
+        ],
+      ),
     );
   }
 }
