@@ -104,6 +104,62 @@ void main() {
       expect(state.totalCount, 1);
     });
 
+    test('row wipes and snapshot shrinks are logged for diagnostics', () {
+      final lines = <String>[];
+      final logged = ConversationState(onLog: lines.add);
+      _injectSnapshot(logged, rows: [
+        {'rowId': 1, 'kind': 'user', 'text': 'a'},
+        {'rowId': 2, 'kind': 'assistant', 'text': 'b'},
+      ], totalCount: 2);
+      expect(lines, isEmpty);
+
+      // row.removed truncation is logged with before/after counts.
+      logged.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [
+            {'op': 'row.removed', 'fromRowId': 1},
+          ],
+        },
+        'fromSeq': 5,
+        'toSeq': 6,
+      }, onGap: () => fail('should not gap'));
+      expect(lines, hasLength(1));
+      expect(lines.single, contains('rows 2 -> 0'));
+
+      // Re-grow to 2 rows, then a snapshot window whose head sits below the
+      // local rows drops the tail — the shrink is logged.
+      lines.clear();
+      logged.applyFrame({
+        'payload': {
+          'kind': 'deltas',
+          'deltas': [
+            {'op': 'row.appended', 'row': {'rowId': 3, 'kind': 'user', 'text': 'c'}},
+            {'op': 'row.appended', 'row': {'rowId': 4, 'kind': 'user', 'text': 'd'}},
+          ],
+        },
+        'fromSeq': 6,
+        'toSeq': 7,
+      }, onGap: () => fail('should not gap'));
+      _injectSnapshot(logged, rows: [
+        {'rowId': 2, 'kind': 'assistant', 'text': 'b'},
+      ], totalCount: 2);
+      expect(lines, hasLength(1));
+      expect(lines.single, contains('snapshot shrank rows: 2 -> 1'));
+
+      // A snapshot whose rows.window is missing wipes and logs.
+      lines.clear();
+      logged.applyFrame({
+        'payload': {
+          'kind': 'snapshot',
+          'snapshot': {'revision': 9, 'rows': {'totalCount': 9}},
+        },
+        'toSeq': 9,
+      }, onGap: () => fail('unexpected gap'));
+      expect(logged.rows, isEmpty);
+      expect(lines.single, contains('rows.window missing'));
+    });
+
     test('row.delta appends text', () {
       _injectSnapshot(state, rows: [
         {'rowId': 1, 'kind': 'assistantText', 'text': 'Hello'},

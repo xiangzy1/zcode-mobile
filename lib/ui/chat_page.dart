@@ -276,7 +276,7 @@ class _ChatPageState extends State<ChatPage> {
     super.initState();
     VoiceModelEvents.changed.addListener(_loadVoiceAvailability);
     _sessionId = widget.sessionId;
-    _transport = widget.session.conversation(widget.scope);
+    _transport = widget.session.conversation(widget.scope, onLog: log);
     _draftConfigReady = _loadSavedDraftConfig();
     _transport.modelCatalogChanged.addListener(_onModelCatalogChanged);
     if (_sessionId != null) {
@@ -548,8 +548,18 @@ class _ChatPageState extends State<ChatPage> {
       // Follow only while pinned; a detached user (scrolled up) must not be
       // yanked back by incoming deltas.
       if (!_stickToBottom || !_scrollController.hasClients) return;
+      final position = _scrollController.position;
+      // When the gap is more than a screenful (list rebuilt/collapsed and
+      // the offset clamped back to the top, or history prepended), animating
+      // the whole distance shows up as the page "re-scrolling from the
+      // top" — snap directly to the bottom instead.
+      if (position.maxScrollExtent - position.pixels >
+          position.viewportDimension) {
+        _scrollController.jumpTo(position.maxScrollExtent);
+        return;
+      }
       _scrollController.animateTo(
-        _scrollController.position.maxScrollExtent,
+        position.maxScrollExtent,
         duration: const Duration(milliseconds: 200),
         curve: Curves.easeOut,
       );

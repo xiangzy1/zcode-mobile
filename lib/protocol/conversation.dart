@@ -1019,7 +1019,7 @@ class ConversationSubscription extends _SubscriptionBase<ConversationState> {
   Timer? _watchdog;
 
   ConversationSubscription._(ConversationTransport transport, this.sessionId)
-      : super(transport, ConversationState(), 'v4');
+      : super(transport, ConversationState(onLog: transport._log), 'v4');
 
   @override
   String get _frameEventName => 'onDynamicConversationFrame';
@@ -1400,6 +1400,15 @@ class SessionsIndexSubscription extends _SubscriptionBase<SessionsIndexState> {
 /// Conversation snapshot + row state, mirrors `fke()`/`pke()` delta
 /// application in the web client.
 class ConversationState extends ChangeNotifier {
+  /// Optional diagnostics hook — logs row wipes/truncations so a UI glitch
+  /// (list momentarily collapsing, view re-scrolling from the top) can be
+  /// traced back to the frame that caused it.
+  final void Function(String line)? _onLog;
+
+  ConversationState({void Function(String line)? onLog}) : _onLog = onLog;
+
+  void _log(String line) => _onLog?.call(line);
+
   Map<String, dynamic>? snapshot;
   List<Map<String, dynamic>> rows = [];
   int seq = 0;
@@ -1439,6 +1448,7 @@ class ConversationState extends ChangeNotifier {
   }
 
   void _applySnapshot(Map<String, dynamic> snap, int toSeq) {
+    final prevCount = rows.length;
     snapshot = snap;
     if (_pendingPatch != null) {
       snapshot = {...snap, ..._pendingPatch!};
@@ -1464,13 +1474,23 @@ class ConversationState extends ChangeNotifier {
                 return id != null && id < head;
               }).toList();
         rows = [...older, ...windowRows];
+        // A shrink means local rows were dropped by the merge (empty window,
+        // rows without rowId, or a window head below the local history). That
+        // collapses the list and yanks the chat view back to the top — log it
+        // so the offending frame shape is identifiable in diagnostics.
+        if (rows.length < prevCount) {
+          _log('[v4] snapshot shrank rows: $prevCount -> ${rows.length} '
+              '(window=${windowRows.length}, older=${older.length})');
+        }
       } else {
         rows = [];
+        _log('[v4] snapshot rows.window missing — cleared $prevCount rows');
       }
       totalCount = (rowsObj['totalCount'] as num?)?.toInt() ?? rows.length;
       firstRowId = (rowsObj['firstRowId'] as num?)?.toInt();
     } else {
       rows = [];
+      _log('[v4] snapshot rows missing — cleared $prevCount rows');
       totalCount = 0;
       firstRowId = null;
     }
@@ -1495,10 +1515,17 @@ class ConversationState extends ChangeNotifier {
         // Mirrors `fke()` in the web client: KEEP rows with
         // rowId < fromRowId (i.e. remove rows >= fromRowId).
         final fromRowId = (delta['fromRowId'] as num?)?.toInt() ?? 0;
+        if (delta['fromRowId'] == null) {
+          _log('[v4] row.removed without fromRowId — treating as clear-all');
+        }
         final kept = rows
             .where((r) => ((r['rowId'] as num?)?.toInt() ?? 0) < fromRowId)
             .toList();
         final removed = rows.length - kept.length;
+        if (removed > 0) {
+          _log('[v4] row.removed fromRowId=$fromRowId: '
+              'rows ${rows.length} -> ${kept.length}');
+        }
         rows = kept;
         if (firstRowId != null && fromRowId <= firstRowId!) {
           totalCount = 0;
