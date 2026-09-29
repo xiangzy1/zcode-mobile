@@ -38,9 +38,19 @@ class _QrScanPageState extends State<QrScanPage> {
     super.dispose();
   }
 
+  /// Single choke point for both camera and gallery results: only a valid
+  /// zemote connection URL may leave this page; anything else gets a hint.
   void _accept(String? raw) {
     if (_handled || raw == null || raw.trim().isEmpty) return;
     final text = raw.trim();
+    if (ZemoteConnectionParams.parse(text) == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text('这不是 ZCode 远程控制二维码，请扫描桌面端弹出的二维码')));
+      }
+      return;
+    }
+    if (!mounted) return;
     _handled = true;
     Navigator.of(context).pop(text);
   }
@@ -151,12 +161,11 @@ String? decodeQrFromImageBytes(Uint8List bytes) {
   }
   final source = RGBLuminanceSource(width, height, pixels);
   final bitmap = BinaryBitmap(HybridBinarizer(source));
-  try {
-    final result = QRCodeReader().decode(bitmap);
-    final text = result.text;
-    if (ZemoteConnectionParams.parse(text) != null) return text;
-    return text.isEmpty ? null : text;
-  } catch (_) {
-    return null;
-  }
+    try {
+      final result = QRCodeReader().decode(bitmap);
+      final text = result.text;
+      return text.isEmpty ? null : text;
+    } catch (_) {
+      return null;
+    }
 }
