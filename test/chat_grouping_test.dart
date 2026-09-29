@@ -3,18 +3,6 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:zemote/ui/chat_page.dart';
 
 void main() {
-  test('compact execution label summarizes tool-heavy turns', () {
-    expect(
-      compactExecutionLabel([
-        {'kind': 'reasoning', 'text': '思考'},
-        {'kind': 'toolCall', 'status': 'success'},
-        {'kind': 'toolCall', 'status': 'running'},
-        {'kind': 'subagent', 'status': 'success'},
-      ]),
-      '执行中 · 2 个工具 · 1 段思考 · 1 个子代理',
-    );
-  });
-
   test('summarizeFileChanges counts files and line changes', () {
     final summary = summarizeFileChanges({
       'files': ['a.dart', 'b.dart'],
@@ -126,6 +114,105 @@ void main() {
     expect(remaining, hasLength(2));
     expect(remaining[0]['text'], 'same');
     expect(remaining[1]['text'], 'failed');
+  });
+
+  group('toolCallPreview', () {
+    test('bash shows the command from JSON input', () {
+      expect(
+        toolCallPreview({
+          'kind': 'toolCall',
+          'toolName': 'bash',
+          'inputText': '{"command":"git status"}',
+        }),
+        'git status',
+      );
+    });
+
+    test('write shows the file path from structured input', () {
+      expect(
+        toolCallPreview({
+          'kind': 'toolCall',
+          'toolName': 'write',
+          'input': {'path': 'lib/ui/chat_page.dart', 'content': '…'},
+        }),
+        'lib/ui/chat_page.dart',
+      );
+    });
+
+    test('plain shell text streams straight through', () {
+      expect(
+        toolCallPreview({
+          'kind': 'toolCall',
+          'toolName': 'bash',
+          'inputText': 'ls -la',
+        }),
+        'ls -la',
+      );
+    });
+
+    test('multi-line commands collapse to one line', () {
+      expect(
+        toolCallPreview({
+          'kind': 'toolCall',
+          'toolName': 'bash',
+          'inputText': '{"command":"flutter analyze\\n--no-pub"}',
+        }),
+        'flutter analyze --no-pub',
+      );
+    });
+
+    test('write strips the workspace prefix from absolute paths', () {
+      expect(
+        toolCallPreview(
+          {
+            'kind': 'toolCall',
+            'toolName': 'write',
+            'input': {'path': '/Users/z/Code/app/lib/main.dart'},
+          },
+          workspaceRoot: '/Users/z/Code/app',
+        ),
+        'lib/main.dart',
+      );
+    });
+
+    test('workspace root with trailing separator still strips', () {
+      expect(
+        toolCallPreview(
+          {
+            'kind': 'toolCall',
+            'toolName': 'edit',
+            'input': {'file_path': '/Users/z/Code/app/test/a_test.dart'},
+          },
+          workspaceRoot: '/Users/z/Code/app/',
+        ),
+        'test/a_test.dart',
+      );
+    });
+
+    test('paths outside the workspace are kept as-is', () {
+      expect(
+        toolCallPreview(
+          {
+            'kind': 'toolCall',
+            'toolName': 'write',
+            'input': {'path': '/etc/hosts'},
+          },
+          workspaceRoot: '/Users/z/Code/app',
+        ),
+        '/etc/hosts',
+      );
+    });
+
+    test('no preview for unrelated tools', () {
+      expect(
+        toolCallPreview({
+          'kind': 'toolCall',
+          'toolName': 'update_plan',
+          'inputText': '{"plan":[]}',
+        }),
+        isNull,
+      );
+    });
   });
 
   group('assistantTurnParts', () {

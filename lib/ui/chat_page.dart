@@ -1229,6 +1229,17 @@ class _ChatPageState extends State<ChatPage> {
           ],
         ),
         actions: [
+          if (state != null && state.ready)
+            AnimatedBuilder(
+              animation: state,
+              builder: (context, _) => _WorkbenchCapsule(
+                state: state,
+                transport: _transport,
+                sessionId: _sessionId ?? '',
+                rpcPlan: _planData,
+                onOpenPlan: _showPlansSheet,
+              ),
+            ),
           if (state != null)
             AnimatedBuilder(
               animation: state,
@@ -1351,6 +1362,9 @@ class _ChatPageState extends State<ChatPage> {
                                   sessionId: _sessionId ?? '',
                                   onAction: _run,
                                   state: state,
+                                  isLast: contentIndex == groups.length - 1,
+                                  workspaceRoot:
+                                      widget.scope['workspacePath'] as String?,
                                 );
                               },
                             ),
@@ -1367,13 +1381,6 @@ class _ChatPageState extends State<ChatPage> {
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       _GoalBanner(state: state),
-                      _ConversationInsights(
-                        state: state,
-                        transport: _transport,
-                        sessionId: _sessionId ?? '',
-                        rpcPlan: _planData,
-                        onOpenPlan: _showPlansSheet,
-                      ),
                       _QueueBar(state: state, transport: _transport),
                       _PendingInteractions(state: state, transport: _transport),
                     ],
@@ -1577,12 +1584,21 @@ class _TurnGroupWidget extends StatelessWidget {
   final Future<void> Function(String, Future<dynamic> Function()) onAction;
   final ConversationState state;
 
+  /// Whether this group is the newest one in the transcript (used to keep
+  /// feedback buttons hidden while the current turn is still running).
+  final bool isLast;
+
+  /// Workspace root used to shorten absolute file paths in tool previews.
+  final String? workspaceRoot;
+
   const _TurnGroupWidget({
     required this.rows,
     required this.transport,
     required this.sessionId,
     required this.onAction,
     required this.state,
+    this.isLast = false,
+    this.workspaceRoot,
   });
 
   @override
@@ -1603,6 +1619,7 @@ class _TurnGroupWidget extends StatelessWidget {
             sessionId: sessionId,
             onAction: onAction,
             state: state,
+            workspaceRoot: workspaceRoot,
           ),
           for (final row in rows.skip(1))
             _RowWidget(
@@ -1611,13 +1628,22 @@ class _TurnGroupWidget extends StatelessWidget {
               sessionId: sessionId,
               onAction: onAction,
               state: state,
+              workspaceRoot: workspaceRoot,
             ),
         ],
       );
     }
     // assistant turn: render parts in original order (reasoning → text →
-    // tool → text …); feedback buttons appear only on the LAST text segment.
+    // tool → text …); feedback buttons appear only on the LAST text segment
+    // and only after the turn finishes — while the turn is still running
+    // (text streaming, turn header in running state, or the conversation
+    // is active and the terminal header has not arrived yet) they stay
+    // hidden.
     final parts = assistantTurnParts(rows);
+    final headerState = (parts.header?['state'] as String?) ?? '';
+    final turnActive = parts.streaming ||
+        headerState == 'running' ||
+        (isLast && state.isRunning && headerState.isEmpty);
     var lastTextIdx = -1;
     for (var i = 0; i < parts.parts.length; i++) {
       if (parts.parts[i].kind == 'text') lastTextIdx = i;
@@ -1633,25 +1659,12 @@ class _TurnGroupWidget extends StatelessWidget {
             'text': p.text,
             if (p.streaming) 'state': 'streaming',
           },
-          showFeedback: i == lastTextIdx,
+          showFeedback: i == lastTextIdx && !turnActive,
           transport: transport,
           sessionId: sessionId,
           onAction: onAction,
           state: state,
-        ));
-      } else if (_isExecutionRow(p.row!)) {
-        final executionRows = <Map<String, dynamic>>[p.row!];
-        while (i + 1 < parts.parts.length &&
-            parts.parts[i + 1].kind == 'row' &&
-            _isExecutionRow(parts.parts[i + 1].row!)) {
-          executionRows.add(parts.parts[++i].row!);
-        }
-        children.add(_ExecutionTrace(
-          rows: executionRows,
-          transport: transport,
-          sessionId: sessionId,
-          onAction: onAction,
-          state: state,
+          workspaceRoot: workspaceRoot,
         ));
       } else {
         children.add(_RowWidget(
@@ -1661,6 +1674,7 @@ class _TurnGroupWidget extends StatelessWidget {
           sessionId: sessionId,
           onAction: onAction,
           state: state,
+          workspaceRoot: workspaceRoot,
         ));
       }
     }
@@ -1674,102 +1688,6 @@ class _TurnGroupWidget extends StatelessWidget {
   }
 }
 
-bool _isExecutionRow(Map<String, dynamic> row) {
-  final kind = row['kind'];
-  return kind == 'toolCall' || kind == 'reasoning' || kind == 'subagent';
-}
-
-String compactExecutionLabel(List<Map<String, dynamic>> rows) {
-  final tools = rows.where((row) => row['kind'] == 'toolCall').length;
-  final reasoning = rows.where((row) => row['kind'] == 'reasoning').length;
-  final subagents = rows.where((row) => row['kind'] == 'subagent').length;
-  final running = rows
-      .any((row) => row['status'] == 'running' || row['state'] == 'streaming');
-  final failed =
-      rows.any((row) => row['status'] == 'error' || row['status'] == 'failed');
-  final parts = <String>[
-    if (running) '执行中',
-    if (failed) '有失败步骤',
-    if (tools > 0) '$tools 个工具',
-    if (reasoning > 0) '$reasoning 段思考',
-    if (subagents > 0) '$subagents 个子代理',
-  ];
-  return parts.isEmpty ? '执行过程' : parts.join(' · ');
-}
-
-class _ExecutionTrace extends StatelessWidget {
-  final List<Map<String, dynamic>> rows;
-  final ConversationTransport transport;
-  final String sessionId;
-  final Future<void> Function(String, Future<dynamic> Function()) onAction;
-  final ConversationState state;
-
-  const _ExecutionTrace({
-    required this.rows,
-    required this.transport,
-    required this.sessionId,
-    required this.onAction,
-    required this.state,
-  });
-
-  bool get _running => rows
-      .any((row) => row['status'] == 'running' || row['state'] == 'streaming');
-
-  bool get _failed =>
-      rows.any((row) => row['status'] == 'error' || row['status'] == 'failed');
-
-  @override
-  Widget build(BuildContext context) {
-    final color = _running
-        ? ZColors.running
-        : _failed
-            ? ZColors.danger
-            : ZInk.muted(context);
-    return Container(
-      margin: const EdgeInsets.symmetric(vertical: 3),
-      decoration: BoxDecoration(
-        color: ZInk.panel(context),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: ZInk.panelBorder(context)),
-      ),
-      child: ExpansionTile(
-        initiallyExpanded: false,
-        dense: true,
-        shape: const Border(),
-        collapsedShape: const Border(),
-        tilePadding: const EdgeInsets.symmetric(horizontal: 11),
-        leading: Icon(
-          _running
-              ? Icons.sync
-              : _failed
-                  ? Icons.error_outline
-                  : Icons.account_tree_outlined,
-          size: 16,
-          color: color,
-        ),
-        title: Text(compactExecutionLabel(rows),
-            style: TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
-                color: ZInk.solid(context))),
-        subtitle: Text('点击查看执行详情',
-            style: TextStyle(fontSize: 10.5, color: ZInk.faint(context))),
-        children: [
-          for (final row in rows)
-            _RowWidget(
-              row: row,
-              showFeedback: false,
-              transport: transport,
-              sessionId: sessionId,
-              onAction: onAction,
-              state: state,
-            ),
-        ],
-      ),
-    );
-  }
-}
-
 class _RowWidget extends StatelessWidget {
   final Map<String, dynamic> row;
   final ConversationTransport transport;
@@ -1778,6 +1696,9 @@ class _RowWidget extends StatelessWidget {
   final ConversationState state;
   final bool showFeedback;
 
+  /// Workspace root used to shorten absolute file paths in tool previews.
+  final String? workspaceRoot;
+
   const _RowWidget({
     required this.row,
     required this.transport,
@@ -1785,6 +1706,7 @@ class _RowWidget extends StatelessWidget {
     required this.onAction,
     required this.state,
     this.showFeedback = true,
+    this.workspaceRoot,
   });
 
   Map<String, dynamic> get _target => {
@@ -1930,7 +1852,7 @@ class _RowWidget extends StatelessWidget {
       'reasoning' => _ReasoningTile(
           text: row['text'] as String? ?? '',
           streaming: row['state'] == 'streaming'),
-      'toolCall' => _ToolCallTile(row: row),
+      'toolCall' => _ToolCallTile(row: row, workspaceRoot: workspaceRoot),
       'turnHeader' => _TurnHeader(row: row),
       'subagent' => _SubagentTile(row: row),
       'timelineMarker' => _TimelineMarkerWidget(row: row),
@@ -2208,61 +2130,188 @@ class _FeedbackButton extends StatelessWidget {
   }
 }
 
-class _ReasoningTile extends StatelessWidget {
+/// Weakened reasoning row: a single gray line a step smaller than body
+/// text. Tapping the line reveals the thinking text below it inside the
+/// current turn; tapping again hides it.
+class _ReasoningTile extends StatefulWidget {
   final String text;
   final bool streaming;
 
   const _ReasoningTile({required this.text, this.streaming = false});
 
   @override
+  State<_ReasoningTile> createState() => _ReasoningTileState();
+}
+
+class _ReasoningTileState extends State<_ReasoningTile> {
+  bool _expanded = false;
+
+  @override
   Widget build(BuildContext context) {
-    return Container(
-      margin: const EdgeInsets.symmetric(vertical: 4),
-      decoration: BoxDecoration(
-        color: ZInk.reasoningPanel(context),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: ZInk.reasoningBorder(context)),
-      ),
-      child: ExpansionTile(
-        initiallyExpanded: streaming,
-        dense: true,
-        shape: const Border(),
-        collapsedShape: const Border(),
-        iconColor: ZColors.running,
-        collapsedIconColor: ZInk.muted(context),
-        tilePadding: const EdgeInsets.symmetric(horizontal: 12),
-        title: Row(
-          children: [
-            Icon(Icons.psychology_outlined,
-                size: 14, color: streaming ? ZColors.running : ZColors.primary),
-            const SizedBox(width: 6),
-            Text(
-              streaming ? '思考中…' : '思考过程',
-              style: TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
-                  color: ZInk.solid(context)),
+    final color = ZInk.muted(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        InkWell(
+          borderRadius: BorderRadius.circular(6),
+          onTap: () => setState(() => _expanded = !_expanded),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 2),
+            child: Row(
+              children: [
+                widget.streaming
+                    ? const SizedBox(
+                        width: 13,
+                        height: 13,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 1.2,
+                          valueColor: AlwaysStoppedAnimation(ZColors.running),
+                        ),
+                      )
+                    : Icon(Icons.psychology_outlined, size: 13, color: color),
+                const SizedBox(width: 5),
+                Expanded(
+                  child: Text(
+                    widget.streaming ? '思考中…' : '思考过程',
+                    style: TextStyle(fontSize: 12.5, color: color),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                Icon(
+                  _expanded ? Icons.expand_less : Icons.expand_more,
+                  size: 16,
+                  color: ZInk.faint(context),
+                ),
+              ],
             ),
-          ],
-        ),
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-            child: ZemoteMarkdown(text, fontSize: 12),
           ),
-        ],
-      ),
+        ),
+        if (_expanded)
+          Container(
+            width: double.infinity,
+            margin: const EdgeInsets.only(top: 2, bottom: 4),
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: ZInk.reasoningPanel(context),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: ZemoteMarkdown(widget.text, fontSize: 12),
+          ),
+      ],
     );
   }
 }
 
-class _ToolCallTile extends StatelessWidget {
+/// One-line preview for the weakened tool-call row: the command for shell
+/// tools, the file path for file tools (with [workspaceRoot] stripped so
+/// absolute paths show relative to the workspace). Returns null when the
+/// row carries nothing recognizable. Values are collapsed to a single
+/// line — the label itself truncates with an ellipsis once it exceeds the
+/// available width.
+String? toolCallPreview(Map<String, dynamic> row, {String? workspaceRoot}) {
+  final inputText = row['inputText'] as String? ?? '';
+  Map<String, dynamic>? args;
+  final input = row['input'];
+  if (input is Map) args = input.cast<String, dynamic>();
+  if (args == null && inputText.isNotEmpty) {
+    try {
+      final decoded = jsonDecode(inputText);
+      if (decoded is Map) args = decoded.cast<String, dynamic>();
+    } catch (_) {}
+  }
+  final name = (row['toolName'] as String? ?? '').toLowerCase();
+  final shellLike = name.contains('bash') || name.contains('shell');
+
+  Object? command;
+  if (args != null) command = args['command'] ?? args['cmd'];
+  if (command is String && command.trim().isNotEmpty) {
+    return _previewOneLine(command);
+  }
+  // Shell input streamed as plain text (not JSON): show it as-is.
+  if (shellLike && args == null && inputText.trim().isNotEmpty) {
+    final raw = inputText.trim();
+    if (!raw.startsWith('{') && !raw.startsWith('[')) {
+      return _previewOneLine(raw);
+    }
+  }
+  if (args != null) {
+    for (final key in const ['filePath', 'file_path', 'path', 'file']) {
+      final value = args[key];
+      if (value is String && value.trim().isNotEmpty) {
+        return _stripWorkspacePrefix(
+            _previewOneLine(value), workspaceRoot);
+      }
+    }
+  }
+  return null;
+}
+
+/// Drops the workspace root prefix from an absolute path so tool previews
+/// stay short (`/a/b/c/lib/main.dart` → `lib/main.dart`). Relative paths and
+/// paths outside the workspace are returned unchanged; `/` and `\` are both
+/// accepted as separators.
+String _stripWorkspacePrefix(String path, String? workspaceRoot) {
+  final root = workspaceRoot?.trim();
+  if (root == null || root.isEmpty) return path;
+  var normalized = root;
+  while (normalized.length > 1 &&
+      (normalized.endsWith('/') || normalized.endsWith('\\'))) {
+    normalized = normalized.substring(0, normalized.length - 1);
+  }
+  if (normalized.isEmpty) return path;
+  if (path == normalized) return '.';
+  for (final sep in const ['/', '\\']) {
+    final prefix = '$normalized$sep';
+    if (path.startsWith(prefix)) {
+      final rest = path.substring(prefix.length);
+      return rest.isEmpty ? '.' : rest;
+    }
+  }
+  return path;
+}
+
+String _previewOneLine(String value) =>
+    value.replaceAll(RegExp(r'\s+'), ' ').trim();
+
+/// Weakened tool-call row: a single gray line a step smaller than body
+/// text — status icon + tool name, with the command (bash) or file path
+/// (write/edit) inlined after the name. Tapping reveals the details below
+/// the line inside the current turn; tapping again hides it. File-edit
+/// rows (write/edit with extractable diff) show ONLY the code diff when
+/// expanded and start out expanded; other tools show the full parameters
+/// and start collapsed.
+class _ToolCallTile extends StatefulWidget {
   final Map<String, dynamic> row;
 
-  const _ToolCallTile({required this.row});
+  /// Workspace root used to shorten absolute file paths in the preview.
+  final String? workspaceRoot;
+
+  const _ToolCallTile({required this.row, this.workspaceRoot});
+
+  @override
+  State<_ToolCallTile> createState() => _ToolCallTileState();
+}
+
+class _ToolCallTileState extends State<_ToolCallTile> {
+  bool _expanded = false;
+
+  /// Whether the user has toggled this row manually. Before that, the row
+  /// follows its default: expanded for file edits, collapsed otherwise.
+  bool _userToggled = false;
+
+  void _toggle() {
+    final currently =
+        _userToggled ? _expanded : extractDiff(widget.row) != null;
+    setState(() {
+      _userToggled = true;
+      _expanded = !currently;
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
+    final row = widget.row;
     final toolName = row['toolName'] as String? ?? 'tool';
     final status = row['status'] as String? ?? '';
     final inputText = row['inputText'] as String? ?? '';
@@ -2272,17 +2321,28 @@ class _ToolCallTile extends StatelessWidget {
     final progress = row['progress'];
     final display = row['display'];
     final diff = extractDiff(row);
+    // File-edit rows (write/edit with extractable old/new text) default to
+    // expanded and show ONLY the diff — parameters stay hidden.
+    final isFileEdit = diff != null;
+    final expanded = _userToggled ? _expanded : isFileEdit;
 
-    final (icon, color) = switch (status) {
+    final (icon, statusLabel, iconColor) = switch (status) {
       'running' || 'inputStreaming' || 'pendingApproval' => (
           Icons.hourglass_top,
-          ZColors.running
+          status == 'pendingApproval' ? '等待批准' : '执行中',
+          ZColors.running,
         ),
-      'success' => (Icons.check, ZColors.success),
-      'error' => (Icons.error_outline, ZColors.danger),
-      'cancelled' => (Icons.block, ZColors.warning),
-      _ => (Icons.build_outlined, ZInk.faint(context)),
+      'success' => (Icons.check, '完成', ZInk.muted(context)),
+      'error' => (Icons.error_outline, '失败', ZColors.danger),
+      'cancelled' => (Icons.block, '已取消', ZColors.warning),
+      _ => (Icons.build_outlined, status, ZInk.muted(context)),
     };
+
+    final preview =
+        toolCallPreview(row, workspaceRoot: widget.workspaceRoot);
+    final label = preview == null
+        ? (statusLabel.isEmpty ? toolName : '$toolName · $statusLabel')
+        : '$toolName · $preview';
 
     final images = display is Map &&
             display['kind'] == 'node_repl_images' &&
@@ -2290,65 +2350,90 @@ class _ToolCallTile extends StatelessWidget {
         ? display['images'] as List
         : const [];
 
-    return Container(
-      margin: const EdgeInsets.symmetric(vertical: 3),
-      decoration: BoxDecoration(
-        color: ZInk.panel(context),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: ZInk.panelBorder(context)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          ExpansionTile(
-            initiallyExpanded: status == 'running' ||
-                status == 'inputStreaming' ||
-                status == 'pendingApproval',
-            dense: true,
-            shape: const Border(),
-            collapsedShape: const Border(),
-            iconColor: color,
-            collapsedIconColor: ZInk.muted(context),
-            tilePadding: const EdgeInsets.symmetric(horizontal: 12),
-            leading: Icon(icon, size: 15, color: color),
-            title: Text(toolName,
-                style: TextStyle(
-                    fontSize: 12.5,
-                    fontFamily: 'monospace',
-                    fontWeight: FontWeight.w600,
-                    color: ZInk.solid(context))),
-            subtitle: Text(status,
-                style: TextStyle(fontSize: 10.5, color: ZInk.muted(context))),
-            children: [
-              if (inputText.isNotEmpty) _kv(context, '输入', inputText),
-              if (outputText.isNotEmpty) _kv(context, '输出', outputText),
-              if (error is Map)
-                _kv(context, '错误',
-                    '${error['code'] ?? ''} ${error['message'] ?? ''}'),
-            ],
-          ),
-          if (progress is Map) _ProgressRow(progress: progress),
-          if (diff != null)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
-              child: DiffView(diff: diff),
-            ),
-          for (final image in images)
-            if (image is Map && image['base64'] is String)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(8),
-                  child: Image.memory(
-                    base64Decode(image['base64'] as String),
-                    cacheWidth: (MediaQuery.sizeOf(context).width * 2).round(),
-                    fit: BoxFit.contain,
-                    errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+    final hasDetail = inputText.isNotEmpty ||
+        outputText.isNotEmpty ||
+        error != null ||
+        progress != null ||
+        diff != null ||
+        images.isNotEmpty;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        InkWell(
+          borderRadius: BorderRadius.circular(6),
+          onTap: hasDetail ? _toggle : null,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 2),
+            child: Row(
+              children: [
+                Icon(icon, size: 13, color: iconColor),
+                const SizedBox(width: 5),
+                Expanded(
+                  child: Text(
+                    label,
+                    style: TextStyle(
+                        fontSize: 12.5,
+                        fontFamily: 'monospace',
+                        color: ZInk.muted(context)),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
                   ),
                 ),
-              ),
-        ],
-      ),
+                if (hasDetail)
+                  Icon(
+                    expanded ? Icons.expand_less : Icons.expand_more,
+                    size: 16,
+                    color: ZInk.faint(context),
+                  ),
+              ],
+            ),
+          ),
+        ),
+        if (expanded)
+          Container(
+            width: double.infinity,
+            margin: const EdgeInsets.only(top: 2, bottom: 4),
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: ZInk.panel(context),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: ZInk.panelBorder(context)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (!isFileEdit && inputText.isNotEmpty)
+                  _kv(context, '输入', inputText),
+                if (!isFileEdit && outputText.isNotEmpty)
+                  _kv(context, '输出', outputText),
+                if (!isFileEdit && error is Map)
+                  _kv(context, '错误',
+                      '${error['code'] ?? ''} ${error['message'] ?? ''}'),
+                if (!isFileEdit && progress is Map)
+                  _ProgressRow(progress: progress),
+                if (diff != null) DiffView(diff: diff),
+                if (!isFileEdit)
+                  for (final image in images)
+                    if (image is Map && image['base64'] is String)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(8),
+                          child: Image.memory(
+                            base64Decode(image['base64'] as String),
+                            cacheWidth:
+                                (MediaQuery.sizeOf(context).width * 2).round(),
+                            fit: BoxFit.contain,
+                            errorBuilder: (_, __, ___) =>
+                                const SizedBox.shrink(),
+                          ),
+                        ),
+                      ),
+              ],
+            ),
+          ),
+      ],
     );
   }
 
@@ -2568,40 +2653,90 @@ class _TimelineMarkerWidget extends StatelessWidget {
   }
 }
 
-class _SubagentTile extends StatelessWidget {
+/// Weakened subagent row, unified with reasoning/tool rows: a single gray
+/// line a step smaller than body text. Tapping reveals the summary below the
+/// line inside the current turn; tapping again hides it.
+class _SubagentTile extends StatefulWidget {
   final Map<String, dynamic> row;
 
   const _SubagentTile({required this.row});
 
   @override
+  State<_SubagentTile> createState() => _SubagentTileState();
+}
+
+class _SubagentTileState extends State<_SubagentTile> {
+  bool _expanded = false;
+
+  @override
   Widget build(BuildContext context) {
-    return Container(
-      margin: const EdgeInsets.symmetric(vertical: 4),
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        color: Colors.deepPurple.withValues(alpha: 0.12),
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: Row(
-        children: [
-          const Icon(Icons.smart_toy_outlined,
-              size: 15, color: Colors.deepPurpleAccent),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+    final row = widget.row;
+    final subagentType = row['subagentType'] as String? ?? '';
+    final status = row['status'] as String? ?? '';
+    final summaryText = row['summaryText'] as String? ?? '';
+
+    final (icon, statusLabel, iconColor) = switch (status) {
+      'running' || 'streaming' || 'pending' || 'pendingApproval' => (
+          Icons.hourglass_top,
+          '执行中',
+          ZColors.running,
+        ),
+      'success' || 'completed' => (Icons.check, '完成', ZInk.muted(context)),
+      'error' || 'failed' => (Icons.error_outline, '失败', ZColors.danger),
+      'cancelled' => (Icons.block, '已取消', ZColors.warning),
+      _ => (Icons.smart_toy_outlined, status, ZInk.muted(context)),
+    };
+
+    final label = [
+      if (subagentType.isNotEmpty) '子代理 · $subagentType' else '子代理',
+      if (statusLabel.isNotEmpty) statusLabel,
+    ].join(' · ');
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        InkWell(
+          borderRadius: BorderRadius.circular(6),
+          onTap: summaryText.isNotEmpty
+              ? () => setState(() => _expanded = !_expanded)
+              : null,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 2),
+            child: Row(
               children: [
-                Text('子代理 · ${row['subagentType'] ?? ''}',
-                    style: const TextStyle(fontSize: 12)),
-                Text('${row['status'] ?? ''}  ${row['summaryText'] ?? ''}',
-                    style: TextStyle(fontSize: 11, color: ZInk.faint(context)),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis),
+                Icon(icon, size: 13, color: iconColor),
+                const SizedBox(width: 5),
+                Expanded(
+                  child: Text(
+                    label,
+                    style: TextStyle(fontSize: 12.5, color: ZInk.muted(context)),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                if (summaryText.isNotEmpty)
+                  Icon(
+                    _expanded ? Icons.expand_less : Icons.expand_more,
+                    size: 16,
+                    color: ZInk.faint(context),
+                  ),
               ],
             ),
           ),
-        ],
-      ),
+        ),
+        if (_expanded && summaryText.isNotEmpty)
+          Container(
+            width: double.infinity,
+            margin: const EdgeInsets.only(top: 2, bottom: 4),
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: ZInk.panel(context),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: ZInk.panelBorder(context)),
+            ),
+            child: ZemoteMarkdown(summaryText, fontSize: 12),
+          ),
+      ],
     );
   }
 }
@@ -2813,14 +2948,17 @@ class _PlanBanner extends StatelessWidget {
   }
 }
 
-class _ConversationInsights extends StatefulWidget {
+/// 会话工作台 collapsed into a top-right capsule. Tapping the capsule
+/// expands a small menu (计划 / 文件变更 / 后台任务); each entry opens the
+/// matching sheet, same content as before.
+class _WorkbenchCapsule extends StatefulWidget {
   final ConversationState state;
   final ConversationTransport transport;
   final String sessionId;
   final Object? rpcPlan;
   final VoidCallback onOpenPlan;
 
-  const _ConversationInsights({
+  const _WorkbenchCapsule({
     required this.state,
     required this.transport,
     required this.sessionId,
@@ -2829,10 +2967,10 @@ class _ConversationInsights extends StatefulWidget {
   });
 
   @override
-  State<_ConversationInsights> createState() => _ConversationInsightsState();
+  State<_WorkbenchCapsule> createState() => _WorkbenchCapsuleState();
 }
 
-class _ConversationInsightsState extends State<_ConversationInsights> {
+class _WorkbenchCapsuleState extends State<_WorkbenchCapsule> {
   Object? _fileData;
   bool _loadingFiles = false;
 
@@ -2864,103 +3002,24 @@ class _ConversationInsightsState extends State<_ConversationInsights> {
     }
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final steps = deriveBestPlanSteps(
-      rows: widget.state.rows,
-      snapshotPlan: widget.state.plan,
-      rpcPlan: widget.rpcPlan,
-    );
-    final works = widget.state.backgroundWorks;
-    final hasPlan = (steps?.isNotEmpty ?? false) ||
-        widget.state.currentMode == 'plan' ||
-        widget.rpcPlan != null;
-    final fileSummary = summarizeFileChanges(_fileData);
-    final completed = steps?.where((step) => step.completed).length ?? 0;
-    return Container(
-      margin: const EdgeInsets.fromLTRB(14, 5, 14, 4),
-      decoration: BoxDecoration(
-        color: ZInk.panel(context),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: ZInk.panelBorder(context)),
-      ),
-      child: ExpansionTile(
-        initiallyExpanded: false,
-        shape: const Border(),
-        collapsedShape: const Border(),
-        tilePadding: const EdgeInsets.fromLTRB(12, 4, 8, 4),
-        leading: Container(
-          width: 30,
-          height: 30,
-          decoration: BoxDecoration(
-            color: ZColors.primary.withValues(alpha: 0.12),
-            borderRadius: BorderRadius.circular(9),
-          ),
-          child: const Icon(Icons.dashboard_customize_outlined,
-              size: 17, color: ZColors.primary),
-        ),
-        title: Text('会话工作台',
-            style: TextStyle(
-                fontSize: 12.5,
-                fontWeight: FontWeight.w600,
-                color: ZInk.solid(context))),
-        subtitle: Text(
-          [
-            hasPlan ? '计划 $completed/${steps?.length ?? 0}' : '暂无计划',
-            fileSummary == null
-                ? '文件未检查'
-                : '文件 ${fileSummary.files} · +${fileSummary.additions} / -${fileSummary.deletions}',
-            works.isEmpty ? '无后台任务' : '${works.length} 个后台任务',
-          ].join(' · '),
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: TextStyle(fontSize: 10.5, color: ZInk.muted(context)),
-        ),
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 0, 8, 8),
-            child: Row(
-              children: [
-                _WorkbenchAction(
-                  tooltip: '计划',
-                  icon: Icons.account_tree_outlined,
-                  active: hasPlan,
-                  badge: steps?.isNotEmpty == true ? '${steps!.length}' : null,
-                  onTap: () =>
-                      _openWorkbench(context, 0, steps ?? const [], works),
-                ),
-                _WorkbenchAction(
-                  tooltip: '文件变更',
-                  icon: Icons.difference_outlined,
-                  active: fileSummary != null && fileSummary.files > 0,
-                  loading: _loadingFiles,
-                  badge: fileSummary == null ? null : '${fileSummary.files}',
-                  onTap: () => _openFiles(context, steps ?? const [], works),
-                ),
-                _WorkbenchAction(
-                  tooltip: '后台任务',
-                  icon: Icons.pending_actions_outlined,
-                  active: works.isNotEmpty,
-                  badge: works.isEmpty ? null : '${works.length}',
-                  onTap: () =>
-                      _openWorkbench(context, 2, steps ?? const [], works),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
+  List<PlanStep> get _steps =>
+      deriveBestPlanSteps(
+        rows: widget.state.rows,
+        snapshotPlan: widget.state.plan,
+        rpcPlan: widget.rpcPlan,
+      ) ??
+      const <PlanStep>[];
 
-  Future<void> _openFiles(BuildContext context, List<PlanStep> steps,
-      List<Map<String, dynamic>> works) async {
+  List<Map<String, dynamic>> get _works => widget.state.backgroundWorks;
+
+  Future<void> _openFiles() async {
     if (_fileData == null) await _loadFiles();
-    if (context.mounted) _openWorkbench(context, 1, steps, works);
+    if (mounted) _openWorkbench(1);
   }
 
-  void _openWorkbench(BuildContext context, int index, List<PlanStep> steps,
-      List<Map<String, dynamic>> works) {
+  void _openWorkbench(int index) {
+    final steps = _steps;
+    final works = _works;
     showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -3006,7 +3065,7 @@ class _ConversationInsightsState extends State<_ConversationInsights> {
                         loading: _loadingFiles,
                         onLoad: () async {
                           Navigator.pop(context);
-                          await _openFiles(this.context, steps, works);
+                          await _openFiles();
                         },
                       ),
                     ),
@@ -3020,61 +3079,111 @@ class _ConversationInsightsState extends State<_ConversationInsights> {
       ),
     );
   }
-}
-
-class _WorkbenchAction extends StatelessWidget {
-  final String tooltip;
-  final IconData icon;
-  final bool active;
-  final bool loading;
-  final String? badge;
-  final VoidCallback onTap;
-
-  const _WorkbenchAction({
-    required this.tooltip,
-    required this.icon,
-    required this.active,
-    required this.onTap,
-    this.loading = false,
-    this.badge,
-  });
 
   @override
-  Widget build(BuildContext context) => Tooltip(
-        message: tooltip,
-        child: Stack(
-          clipBehavior: Clip.none,
+  Widget build(BuildContext context) {
+    final steps = _steps;
+    final works = _works;
+    final hasPlan = steps.isNotEmpty ||
+        widget.state.currentMode == 'plan' ||
+        widget.rpcPlan != null;
+    final fileSummary = summarizeFileChanges(_fileData);
+    final completed = steps.where((step) => step.completed).length;
+    final hasContent =
+        hasPlan || works.isNotEmpty || (fileSummary?.files ?? 0) > 0;
+
+    return PopupMenuButton<String>(
+      tooltip: '会话工作台',
+      onSelected: (key) {
+        switch (key) {
+          case 'plan':
+            _openWorkbench(0);
+          case 'files':
+            _openFiles();
+          case 'works':
+            _openWorkbench(2);
+        }
+      },
+      itemBuilder: (context) => [
+        PopupMenuItem(
+          value: 'plan',
+          child: Row(
+            children: [
+              Icon(Icons.account_tree_outlined,
+                  size: 16, color: ZInk.muted(context)),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                    hasPlan ? '计划 $completed/${steps.length}' : '计划'),
+              ),
+            ],
+          ),
+        ),
+        PopupMenuItem(
+          value: 'files',
+          child: Row(
+            children: [
+              Icon(Icons.difference_outlined,
+                  size: 16, color: ZInk.muted(context)),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  fileSummary == null
+                      ? '文件变更'
+                      : '文件 ${fileSummary.files} · +${fileSummary.additions} / -${fileSummary.deletions}',
+                ),
+              ),
+            ],
+          ),
+        ),
+        PopupMenuItem(
+          value: 'works',
+          child: Row(
+            children: [
+              Icon(Icons.pending_actions_outlined,
+                  size: 16, color: ZInk.muted(context)),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(works.isEmpty ? '后台任务' : '后台任务 ${works.length}'),
+              ),
+            ],
+          ),
+        ),
+      ],
+      child: Container(
+        margin: const EdgeInsets.only(right: 2),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          color: ZColors.primary.withValues(alpha: 0.10),
+          borderRadius: BorderRadius.circular(999),
+          border: Border.all(color: ZColors.primary.withValues(alpha: 0.35)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            IconButton(
-              visualDensity: VisualDensity.compact,
-              onPressed: onTap,
-              icon: loading
-                  ? const SizedBox(
-                      width: 16,
-                      height: 16,
-                      child: CircularProgressIndicator(strokeWidth: 1.7),
-                    )
-                  : Icon(icon,
-                      size: 19,
-                      color: active ? ZColors.primary : ZInk.muted(context)),
-            ),
-            if (badge != null)
-              Positioned(
-                right: 2,
-                top: 1,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 4),
-                  decoration: BoxDecoration(
-                    color: active ? ZColors.primary : ZInk.faint(context),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Text(badge!,
-                      style: const TextStyle(fontSize: 8, color: Colors.white)),
+            const Icon(Icons.dashboard_customize_outlined,
+                size: 13, color: ZColors.primary),
+            const SizedBox(width: 4),
+            Text('工作台',
+                style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: ZInk.solid(context))),
+            if (hasContent)
+              Container(
+                margin: const EdgeInsets.only(left: 5),
+                width: 5,
+                height: 5,
+                decoration: BoxDecoration(
+                  color: ZColors.primary,
+                  shape: BoxShape.circle,
                 ),
               ),
           ],
         ),
-      );
+      ),
+    );
+  }
 }
 
 class _PlanSummary extends StatelessWidget {
