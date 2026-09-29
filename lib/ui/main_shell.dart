@@ -42,6 +42,41 @@ String workspaceTitle(Map<String, dynamic> w) {
   return workspaceKeyOf(w) ?? '未知工作区';
 }
 
+/// Latest task `updatedAt` seen per workspace key (see [workspaceKeyOf]),
+/// ingested from the bootstrap / workspace-list global task lists.
+typedef TaskTimeByKey = Map<String, int>;
+
+int latestTaskTimeOf(Map<String, dynamic> w, TaskTimeByKey taskTimeByKey) {
+  final identity = w['workspaceIdentity'];
+  if (identity is String && identity.trim().isNotEmpty) {
+    return taskTimeByKey[identity.trim()] ?? 0;
+  }
+  final path = w['workspacePath'];
+  if (path is String && path.isNotEmpty) return taskTimeByKey[path] ?? 0;
+  return taskTimeByKey[workspaceKeyOf(w)] ?? 0;
+}
+
+/// Picker order: workspaces with newer task activity first. Ties (and
+/// workspaces without task data) keep the desktop's original relative order
+/// via the stable index sort.
+List<Map<String, dynamic>> sortWorkspacesByTaskTime(
+  List<dynamic> workspaces,
+  TaskTimeByKey taskTimeByKey,
+) {
+  final maps = [
+    for (final w in workspaces)
+      if (w is Map) w.cast<String, dynamic>(),
+  ];
+  final order = List<int>.generate(maps.length, (i) => i);
+  order.sort((a, b) {
+    final byTime =
+        latestTaskTimeOf(maps[b], taskTimeByKey)
+            .compareTo(latestTaskTimeOf(maps[a], taskTimeByKey));
+    return byTime != 0 ? byTime : a.compareTo(b);
+  });
+  return [for (final i in order) maps[i]];
+}
+
 /// Multi-device shell: driven by [AppSession]. Shows the active device's
 /// workspace/tasks/settings, with a device switcher to jump between
 /// simultaneously-connected devices without reconnecting.
@@ -143,6 +178,7 @@ class _MainShellContent extends StatefulWidget {
 class _MainShellContentState extends State<_MainShellContent> {
   int _tab = 0;
   List<dynamic> _workspaces = const [];
+  final TaskTimeByKey _taskTimeByKey = {};
   bool _loading = true;
   String? _error;
   Map<String, dynamic>? _activeWorkspace;
@@ -161,7 +197,11 @@ class _MainShellContentState extends State<_MainShellContent> {
     _updatedSub = widget.client.workspaceListUpdated.listen((result) {
       if (!mounted || result is! Map) return;
       final list = result['workspaces'];
-      if (list is List) setState(() => _workspaces = list);
+      final tasks = result['tasks'];
+      setState(() {
+        if (list is List) _workspaces = list;
+        if (tasks is List) _ingestTaskTimes(tasks);
+      });
     });
     _load();
   }
@@ -184,8 +224,10 @@ class _MainShellContentState extends State<_MainShellContent> {
       final bootstrap = await widget.client.bootstrap();
       if (!mounted) return;
       final list = bootstrap['workspaces'];
+      final tasks = bootstrap['tasks'];
       setState(() {
         _workspaces = list is List ? list : const [];
+        if (tasks is List) _ingestTaskTimes(tasks);
         _loading = false;
       });
       // Auto-open single workspace (web mobile flow).
@@ -201,6 +243,25 @@ class _MainShellContentState extends State<_MainShellContent> {
         _error = '$e';
         _loading = false;
       });
+    }
+  }
+
+  /// Collects the newest task `updatedAt` per workspace from the global task
+  /// lists carried by bootstrap / workspace-list messages. Workspace entries
+  /// themselves carry no task timestamps (mirrors `HC()` keying on the web).
+  void _ingestTaskTimes(List<dynamic> tasks) {
+    for (final t in tasks) {
+      if (t is! Map) continue;
+      final updatedAt = t['updatedAt'];
+      if (updatedAt is! num || updatedAt <= 0) continue;
+      final identity = t['workspaceIdentity'];
+      final path = t['workspacePath'];
+      final key = identity is String && identity.trim().isNotEmpty
+          ? identity.trim()
+          : (path is String && path.isNotEmpty ? path : null);
+      if (key == null) continue;
+      final ms = updatedAt.toInt();
+      if (ms > (_taskTimeByKey[key] ?? 0)) _taskTimeByKey[key] = ms;
     }
   }
 
@@ -399,6 +460,7 @@ class _MainShellContentState extends State<_MainShellContent> {
         0 => bridge == null
             ? _WorkspacePicker(
                 workspaces: _workspaces,
+                taskTimeByKey: _taskTimeByKey,
                 loading: _loading || _bridgeOpening,
                 error: _error,
                 client: widget.client,
@@ -648,6 +710,7 @@ class _DeviceSwitchSheet extends StatelessWidget {
 
 class _WorkspacePicker extends StatelessWidget {
   final List<dynamic> workspaces;
+  final TaskTimeByKey taskTimeByKey;
   final bool loading;
   final String? error;
   final ZemoteClient client;
@@ -656,6 +719,7 @@ class _WorkspacePicker extends StatelessWidget {
 
   const _WorkspacePicker({
     required this.workspaces,
+    required this.taskTimeByKey,
     required this.loading,
     required this.error,
     required this.client,
@@ -665,6 +729,9 @@ class _WorkspacePicker extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Non-map entries are dropped by the sort helper, so the list length
+    // and the item count stay consistent.
+    final ordered = sortWorkspacesByTaskTime(workspaces, taskTimeByKey);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -687,19 +754,17 @@ class _WorkspacePicker extends StatelessWidget {
               ? const Center(child: CircularProgressIndicator())
               : error != null
                   ? Center(child: Text('加载失败: $error'))
-                  : workspaces.isEmpty
+                  : ordered.isEmpty
                       ? Center(
                           child: Text('桌面端没有打开的工作区',
                               style: TextStyle(color: ZInk.faint(context))))
                       : ListView.separated(
                           padding: const EdgeInsets.all(16),
-                          itemCount: workspaces.length,
+                          itemCount: ordered.length,
                           separatorBuilder: (_, __) =>
                               const SizedBox(height: 10),
                           itemBuilder: (context, index) {
-                            final w = workspaces[index];
-                            if (w is! Map) return const SizedBox.shrink();
-                            final workspace = w.cast<String, dynamic>();
+                            final workspace = ordered[index];
                             final key = workspaceKeyOf(workspace);
                             final kind = '${workspace['kind'] ?? ''}';
                             return Card(
