@@ -1,11 +1,3 @@
-# 由于ZCode 在登录状态下会静默RSA打包整个工作区及完整Git 历史上传至云端对象存储，本项目宣布永久停更！
-
-https://linux.do/t/topic/2917956
-
-https://linux.do/t/topic/2917923
-
-推荐使用[paseo](https://github.com/getpaseo/paseo)和[oh-my-pi](https://www.pi-gui.com/)，完美替代
----
 <div align="center">
 
 # Zemote
@@ -29,7 +21,7 @@ https://linux.do/t/topic/2917923
 
 ## 目录
 
-- [反馈与 AI 自动修复](#反馈与-ai-自动修复)
+- [反馈](#反馈)
 - [功能特性](#功能特性)
 - [平台](#平台)
 - [快速开始](#快速开始)
@@ -49,9 +41,9 @@ https://linux.do/t/topic/2917923
 
 **欢迎大家提交 [Issue](https://github.com/HumanAILoop/zemote/issues)！** 🎉
 
-无论是 Bug 反馈、功能建议，还是界面 / 交互体验问题，都欢迎通过 Issue 提出。本项目采用 **AI 全自动修复** 流程：你提交的 Issue 会被自动分析、定位、修复，并随新的 Beta 版本发布，通常无需人工介入。
+无论是 Bug 反馈、功能建议，还是界面 / 交互体验问题，都欢迎通过 Issue 提出。
 
-为了让自动修复更准确、更快，建议在 Issue 中尽量写清楚：
+为了让修复更准确、更快，建议在 Issue 中尽量写清楚：
 
 - **问题现象**：发生了什么，你期望发生什么
 - **复现步骤**：怎样稳定复现
@@ -104,13 +96,13 @@ https://linux.do/t/topic/2917923
 | Android | ✅ 主要目标平台 |
 | Web | ✅ 可用（调试 / 快速预览） |
 | Windows | ⚙️ 桌面端可用（未重点优化） |
-| iOS / macOS / Linux | 未验证（理论上可构建） |
+| iOS / macOS / Linux | ✅ 可用 |
 
 ## 快速开始
 
 ### 前置条件
 
-- Flutter SDK（本项目 `sdk: ^3.5.0`）
+- Flutter SDK（本项目 `sdk: ^3.47.5`）
 - 桌面端已安装并打开 **ZCode**（zcode.z.ai）
 
 ### 获取远程控制 URL
@@ -124,7 +116,7 @@ https://zcode.z.ai/remote/v4?sid=...&hash=...&t=...&mid=...&name=...
 ### 运行
 
 ```bash
-# Android
+# Android/iOS
 flutter run
 
 # Web（快速预览）
