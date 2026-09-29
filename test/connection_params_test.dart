@@ -152,4 +152,46 @@ void main() {
       expect(params!.theme, 'dark');
     });
   });
+
+  group('real pairing URL (desktop 3.14.3)', () {
+    const url =
+        'https://zcode.z.ai/remote/v4?sid=d_BxgjjxeyR7q7i1rav8ufe4'
+        '&hash=BazX7SUXynW894n5kfAhVJlJ0gxzEgBDrm21xbJIV5s%3D'
+        '&t=1790653205808'
+        '&mid=8ffbf4f7-0981-4bd9-ad4c-bccd5a894679'
+        '&name=mbp-m5.local&app_version=3.14.3';
+    final params = ZemoteConnectionParams.parse(url);
+
+    test('parses every field, decoding the padded hash', () {
+      expect(params, isNotNull);
+      expect(params!.deviceSid, 'd_BxgjjxeyR7q7i1rav8ufe4');
+      expect(
+          params.passHash, 'BazX7SUXynW894n5kfAhVJlJ0gxzEgBDrm21xbJIV5s=');
+      expect(params.timestamp, 1790653205808);
+      expect(params.deviceMid, '8ffbf4f7-0981-4bd9-ad4c-bccd5a894679');
+      expect(params.deviceName, 'mbp-m5.local');
+      expect(params.appVersion, '3.14.3');
+    });
+
+    test('relay ws target includes mid', () {
+      expect(
+        params!.relayWsUri.toString(),
+        'wss://zcode.z.ai/ws?mid=8ffbf4f7-0981-4bd9-ad4c-bccd5a894679',
+      );
+    });
+
+    test('upgrade headers mirror the browser handshake', () {
+      expect(params!.upgradeHeaders(), {
+        'Origin': 'https://zcode.z.ai',
+        'Referer': url,
+      });
+    });
+
+    test('non-default port lands in Origin', () {
+      final p = ZemoteConnectionParams.parse(
+        'https://zcode.z.ai:8443/remote/v4?sid=s&hash=h&t=1',
+      );
+      expect(p!.upgradeHeaders()['Origin'], 'https://zcode.z.ai:8443');
+    });
+  });
 }

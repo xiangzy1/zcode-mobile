@@ -70,5 +70,23 @@ class ZemoteConnectionParams {
     return base.replace(queryParameters: {'mid': deviceMid});
   }
 
+  /// Upgrade-request headers mirroring what the browser sends when the
+  /// remote page opens the relay socket: `Origin` from the page origin and
+  /// `Referer` = the full pairing URL. dart:io sends neither by default and
+  /// the relay may check them; the browser path ignores these (it sets its
+  /// own). User-Agent / cookies stay browser-only — no evidence the relay
+  /// validates them.
+  Map<String, String> upgradeHeaders() {
+    final scheme = uriSchemeIsSecure ? 'https' : 'http';
+    final defaultPort =
+        (source.scheme == 'https' || source.scheme == 'wss') ? 443 : 80;
+    final port =
+        source.hasPort && source.port != defaultPort ? ':${source.port}' : '';
+    return {
+      'Origin': '$scheme://${source.host}$port',
+      'Referer': source.toString(),
+    };
+  }
+
   bool get uriSchemeIsSecure => source.scheme == 'https' || source.scheme == 'wss';
 }

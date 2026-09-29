@@ -7,6 +7,8 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 import 'connection_params.dart';
 import 'device_info.dart';
 import 'proof.dart';
+import 'relay_socket_stub.dart'
+    if (dart.library.io) 'relay_socket_io.dart';
 
 enum RelayState {
   idle,
@@ -127,7 +129,9 @@ class RelayClient {
     _log('[relay] connecting ${_safeUriForLog(uri)}');
     WebSocketChannel socket;
     try {
-      socket = WebSocketChannel.connect(uri);
+      // Native sockets mirror the browser's upgrade request (Origin/
+      // Referer from the pairing URL); on web the browser sends its own.
+      socket = connectRelaySocket(uri, params.upgradeHeaders());
       await socket.ready;
     } catch (e) {
       _connectInFlight = false;
