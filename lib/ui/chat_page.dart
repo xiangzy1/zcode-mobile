@@ -3,6 +3,7 @@ import 'dart:convert';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show ScrollDirection;
 import 'package:flutter/services.dart';
 
 import '../protocol/channel_client.dart';
@@ -266,7 +267,6 @@ class _ChatPageState extends State<ChatPage> {
     VoiceModelEvents.changed.addListener(_loadVoiceAvailability);
     _sessionId = widget.sessionId;
     _transport = widget.session.conversation(widget.scope);
-    _scrollController.addListener(_onScroll);
     if (_sessionId != null) {
       _subscribe();
     }
@@ -282,10 +282,22 @@ class _ChatPageState extends State<ChatPage> {
     });
   }
 
-  void _onScroll() {
-    if (!_scrollController.hasClients) return;
-    final max = _scrollController.position.maxScrollExtent;
-    _stickToBottom = _scrollController.position.pixels >= max - 40;
+  /// User gestures own the follow state: swiping up (away from the bottom)
+  /// detaches auto-scroll, landing back at the bottom re-pins. Programmatic
+  /// animations and streaming content growth never touch it — the old
+  /// position-based listener also fired for those and re-yanked the view.
+  bool _onUserScroll(ScrollNotification n) {
+    if (n.depth != 0 || n.metrics.axis != Axis.vertical) return false;
+    if (n is! UserScrollNotification) return false;
+    switch (n.direction) {
+      case ScrollDirection.forward: // swiping up, away from the bottom
+        _stickToBottom = false;
+      case ScrollDirection.reverse: // swiping down, toward the bottom
+        break;
+      case ScrollDirection.idle: // gesture/ballistic ended
+        _stickToBottom = n.metrics.pixels >= n.metrics.maxScrollExtent - 40;
+    }
+    return false;
   }
 
   Future<void> _loadPrep() async {
@@ -489,17 +501,14 @@ class _ChatPageState extends State<ChatPage> {
 
   void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_scrollController.hasClients) return;
-      final max = _scrollController.position.maxScrollExtent;
-      // Snap to the newest message on open; afterwards only follow while the
-      // user is already near the bottom (so reading history isn't yanked).
-      if (_stickToBottom || _scrollController.position.pixels > max - 400) {
-        _scrollController.animateTo(
-          max,
-          duration: const Duration(milliseconds: 200),
-          curve: Curves.easeOut,
-        );
-      }
+      // Follow only while pinned; a detached user (scrolled up) must not be
+      // yanked back by incoming deltas.
+      if (!_stickToBottom || !_scrollController.hasClients) return;
+      _scrollController.animateTo(
+        _scrollController.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 200),
+        curve: Curves.easeOut,
+      );
     });
   }
 
@@ -669,6 +678,10 @@ class _ChatPageState extends State<ChatPage> {
       _showSlash = false;
       _progress = null;
     });
+    // Sending counts as intent to follow the reply, even if the user had
+    // scrolled up to read history.
+    _stickToBottom = true;
+    _scrollToBottom();
     try {
       var sessionId = _sessionId;
       if (sessionId == null) {
@@ -1151,57 +1164,60 @@ class _ChatPageState extends State<ChatPage> {
                                     style:
                                         TextStyle(color: ZInk.faint(context))));
                           }
-                          return ListView.builder(
-                            controller: _scrollController,
-                            padding: const EdgeInsets.fromLTRB(14, 14, 14, 8),
-                            itemCount: itemCount,
-                            itemBuilder: (context, index) {
-                              if (state.canLoadOlder && index == 0) {
-                                return Center(
-                                  child: TextButton.icon(
-                                    onPressed:
-                                        _loadingOlder ? null : _loadOlder,
-                                    icon: _loadingOlder
-                                        ? const SizedBox(
-                                            width: 12,
-                                            height: 12,
-                                            child: CircularProgressIndicator(
-                                                strokeWidth: 1.5),
-                                          )
-                                        : const Icon(Icons.history, size: 14),
-                                    label: const Text('加载更早消息',
-                                        style: TextStyle(fontSize: 12)),
-                                  ),
-                                );
-                              }
-                              final contentIndex =
-                                  index - (state.canLoadOlder ? 1 : 0);
-                              if (contentIndex >= groups.length) {
-                                final echo =
-                                    _echoes[contentIndex - groups.length];
-                                return _UserBubble(
-                                  row: {
-                                    'kind': 'userInput',
-                                    'text': echo['text'],
-                                    'attachments': echo['attachments'],
-                                  },
+                          return NotificationListener<ScrollNotification>(
+                            onNotification: _onUserScroll,
+                            child: ListView.builder(
+                              controller: _scrollController,
+                              padding: const EdgeInsets.fromLTRB(14, 14, 14, 8),
+                              itemCount: itemCount,
+                              itemBuilder: (context, index) {
+                                if (state.canLoadOlder && index == 0) {
+                                  return Center(
+                                    child: TextButton.icon(
+                                      onPressed:
+                                          _loadingOlder ? null : _loadOlder,
+                                      icon: _loadingOlder
+                                          ? const SizedBox(
+                                              width: 12,
+                                              height: 12,
+                                              child: CircularProgressIndicator(
+                                                  strokeWidth: 1.5),
+                                            )
+                                          : const Icon(Icons.history, size: 14),
+                                      label: const Text('加载更早消息',
+                                          style: TextStyle(fontSize: 12)),
+                                    ),
+                                  );
+                                }
+                                final contentIndex =
+                                    index - (state.canLoadOlder ? 1 : 0);
+                                if (contentIndex >= groups.length) {
+                                  final echo =
+                                      _echoes[contentIndex - groups.length];
+                                  return _UserBubble(
+                                    row: {
+                                      'kind': 'userInput',
+                                      'text': echo['text'],
+                                      'attachments': echo['attachments'],
+                                    },
+                                    transport: _transport,
+                                    sessionId: _sessionId ?? '',
+                                    badge: '${echo['status'] ?? 'sending'}',
+                                    onRetry: echo['status'] == 'failed'
+                                        ? () => _retryEcho(echo)
+                                        : null,
+                                  );
+                                }
+                                final group = groups[contentIndex];
+                                return _TurnGroupWidget(
+                                  rows: group,
                                   transport: _transport,
                                   sessionId: _sessionId ?? '',
-                                  badge: '${echo['status'] ?? 'sending'}',
-                                  onRetry: echo['status'] == 'failed'
-                                      ? () => _retryEcho(echo)
-                                      : null,
+                                  onAction: _run,
+                                  state: state,
                                 );
-                              }
-                              final group = groups[contentIndex];
-                              return _TurnGroupWidget(
-                                rows: group,
-                                transport: _transport,
-                                sessionId: _sessionId ?? '',
-                                onAction: _run,
-                                state: state,
-                              );
-                            },
+                              },
+                            ),
                           );
                         },
                       )
