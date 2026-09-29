@@ -156,6 +156,16 @@ class _TaskHomePageState extends State<TaskHomePage>
   /// merge must not leak them into the active list.
   final Set<String> _archivedIds = {};
 
+  /// The channel task list (`listTasks`) reports turn-level status that lags
+  /// the live sessions-index — a running task briefly shows as completed
+  /// until the index merges. Hold the list UI (skeleton) until the first
+  /// live snapshot arrives, or give up waiting (subscribe failure / timer).
+  bool _liveStatusReady = false;
+  bool _liveStatusFailed = false;
+  Timer? _liveStatusFallback;
+
+  bool get _liveGateOpen => _liveStatusReady || _liveStatusFailed;
+
   bool _isRecentlyRemoved(String taskId) {
     final at = _recentlyRemoved[taskId];
     if (at == null) return false;
@@ -185,6 +195,13 @@ class _TaskHomePageState extends State<TaskHomePage>
     _convTransport = widget.session.conversation(_scope, onLog: log);
     _loadCache();
     _subscribeSessionsIndex();
+    // Never hold the skeleton forever if the desktop never delivers a live
+    // sessions-index (older builds): fall back to channel/cache data.
+    _liveStatusFallback = Timer(const Duration(seconds: 15), () {
+      if (!mounted || _liveStatusReady) return;
+      _liveStatusFailed = true;
+      if (_loading) setState(() => _loading = false);
+    });
     _updatedSub = widget.client.workspaceListUpdated.listen((result) {
       if (!mounted || result is! Map) return;
       final tasks = result['tasks'];
@@ -233,6 +250,7 @@ class _TaskHomePageState extends State<TaskHomePage>
   void dispose() {
     _tabController.dispose();
     _searchController.dispose();
+    _liveStatusFallback?.cancel();
     _updatedSub?.cancel();
     _sessionsSub?.dispose();
     super.dispose();
@@ -251,6 +269,8 @@ class _TaskHomePageState extends State<TaskHomePage>
       sub.state.addListener(_mergeSessions);
       _mergeSessions();
     } catch (e) {
+      _liveStatusFailed = true;
+      if (mounted && _loading) setState(() => _loading = false);
       log('[home] sessions-index subscribe failed: $e');
     }
   }
@@ -259,6 +279,8 @@ class _TaskHomePageState extends State<TaskHomePage>
     final sub = _sessionsSub;
     if (sub == null || !mounted) return;
     if (!sub.state.ready) return;
+    _liveStatusReady = true;
+    _liveStatusFallback?.cancel();
     log('[home] sessions-index ready count=${sub.state.list.length}');
     setState(() {
       _rebuildTasks();
@@ -296,7 +318,9 @@ class _TaskHomePageState extends State<TaskHomePage>
     setState(() {
       _channelTasks = cached;
       _rebuildTasks();
-      _loading = false;
+      // Cached statuses may be stale (see _liveGateOpen) — keep the
+      // skeleton until the live index confirms or the wait gives up.
+      if (_liveGateOpen) _loading = false;
     });
     log('[home] cache restored count=${cached.length}');
   }
@@ -340,7 +364,7 @@ class _TaskHomePageState extends State<TaskHomePage>
             for (final t in _archived)
               if (t is Map && t['taskId'] != null) '${t['taskId']}',
           ]);
-        _loading = false;
+        if (_liveGateOpen) _loading = false;
         _rebuildTasks();
       });
       _saveCache();
